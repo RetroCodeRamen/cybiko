@@ -16,10 +16,11 @@ The first wireless implementation is a small LoRa link that carries the same gue
 
 | Path | Role |
 |---|---|
-| `cybiko-java-emulator-main` | MIT reference. Radio co-processor, UDP, SDR, V1/XT/V2 behavior |
 | `cybiko-c-emulator` | Host H8S core, unit tests, radio codec, `radio_sim`, SX1262 PHY, Heltec serial PHY, `two_boot`, SDL `--radio` |
 | `cybiko-lilygo` | T-Deck firmware. Vendored core (XT default, V1 env), display, keyboard, audio, SD, LoRa pump |
 | `cybiko-heltec-modem` | Heltec WiFi LoRa 32 V3. Same SX1262 PHY. SLIP to the PC emulator |
+
+The Java emulator (`cybiko-java-emulator-main` on this machine) is a local MIT reference for co-processor, SCI/DTC, and V1/XT/V2 behavior. It is not part of the GitHub repo.
 
 The two C cores have diverged. The Linux tree is what `make test` covers. The T-Deck tree adds PSRAM placement, sleep fast-forward, `EMU_TIMER_STRIDE`, Timer16/SCI2 batching, and a compile-time machine switch (`machine.h`). Radio sources live once under `cybiko-c-emulator/src/radio/` and are compiled into firmware from there.
 

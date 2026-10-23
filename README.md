@@ -29,10 +29,11 @@ Checked on this machine on 22 Oct 2026.
 
 | Path | Role |
 |---|---|
-| `cybiko-java-emulator-main` | Behavioral reference. Radio co-processor, UDP, and SDR bridge. MIT, Dan Berkowitz |
 | `cybiko-c-emulator` | H8S core, host tests, radio codec, `two_boot`, SDL `--radio` |
 | `cybiko-lilygo` | T-Deck firmware. XT default, V1 env. Display, keyboard, audio, SD, LoRa pump |
 | `cybiko-heltec-modem` | Heltec WiFi LoRa 32 V3. Same SX1262 PHY. USB SLIP to the PC emulator |
+
+Dan Berkowitz's Java emulator stays on this machine as `cybiko-java-emulator-main` for radio and SCI behavior. It is not in the GitHub repo.
 
 ## Card layout
 

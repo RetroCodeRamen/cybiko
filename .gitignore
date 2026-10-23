@@ -9,6 +9,9 @@ save.tmp
 # Nested upstream .git directories, kept locally so history is not lost.
 .git.upstream/
 
+# Dan Berkowitz's Java emulator. Local reference only; not this project.
+cybiko-java-emulator-main/
+
 # Build and IDE
 .pio/
 build/
