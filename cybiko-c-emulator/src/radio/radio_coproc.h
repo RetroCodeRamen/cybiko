@@ -1,0 +1,114 @@
+#ifndef CYBIKO_RADIO_COPROC_H
+#define CYBIKO_RADIO_COPROC_H
+
+/*
+ * Emulated Cybiko AVR radio co-processor.
+ *
+ * Ported in behavior from RadioCoProcessor.java (MIT, Copyright 2026
+ * Dan Berkowitz). The guest still talks SCI. This object is the point
+ * where those bytes become transport payloads and come back.
+ *
+ * complete_tx_dtc does not wait. The Java object waits 15 ms so a UDP
+ * peer can answer inside one exchange. LoRa airtime is hundreds of
+ * milliseconds; blocking here would stall the frame loop and still miss
+ * that window. The host pumps the transport, then try_async_delivery()
+ * injects a frame once the guest radio is idle.
+ *
+ * A queued 0x03 is the local AVR accepting a command. It is not a
+ * statement that another radio received the packet.
+ */
+
+#include "radio_transport.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define CYBIKO_RADIO_MAX_PAYLOAD 240
+#define CYBIKO_RADIO_RX_CAP      4
+#define CYBIKO_RADIO_RXQ         512
+#define CYBIKO_RADIO_IND_SMALL   0x32
+#define CYBIKO_RADIO_IND_LARGE   0xC8
+#define CYBIKO_RADIO_ACK         0x03
+
+typedef enum {
+    CYBIKO_RADIO_CMD_NONE = 0,
+    CYBIKO_RADIO_CMD_POLL = 1,
+    CYBIKO_RADIO_CMD_SCAN = 2
+} cybiko_radio_cmd_t;
+
+typedef size_t (*cybiko_radio_beacon_fn)(void *user, uint8_t *dst, size_t cap);
+
+typedef struct {
+    uint8_t  data[CYBIKO_RADIO_MAX_PAYLOAD];
+    uint16_t len;
+    uint32_t sender_id;
+} cybiko_radio_frame_t;
+
+typedef struct cybiko_radio_coproc {
+    cybiko_radio_transport_t *transport;
+    bool v1_mode;
+    bool v2_mode;
+    bool initialized;
+    bool v1_accum;
+    bool rx_frame_ready;
+    bool async_rx_pending;
+    uint8_t current_channel;
+    cybiko_radio_cmd_t last_command;
+
+    uint8_t cmd[3];
+    int cmd_pos;
+
+    uint8_t v1_buf[210];
+    int v1_len;
+
+    cybiko_radio_frame_t frames[CYBIKO_RADIO_RX_CAP];
+    int q_head;
+    int q_count;
+
+    uint8_t rxq[CYBIKO_RADIO_RXQ];
+    int rxq_head;
+    int rxq_tail;
+    int rxq_count;
+
+    cybiko_radio_beacon_fn beacon_fn;
+    void *beacon_user;
+
+    uint32_t stat_tx;
+    uint32_t stat_tx_drop;
+    uint32_t stat_rx;
+    uint32_t stat_overflow;
+    uint16_t last_tx_len;
+    uint8_t  last_tx[24];
+} cybiko_radio_coproc_t;
+
+void cybiko_radio_coproc_init(cybiko_radio_coproc_t *c);
+void cybiko_radio_coproc_set_transport(cybiko_radio_coproc_t *c, cybiko_radio_transport_t *t);
+void cybiko_radio_coproc_set_v1(cybiko_radio_coproc_t *c, bool v1);
+void cybiko_radio_coproc_set_v2(cybiko_radio_coproc_t *c, bool v2);
+void cybiko_radio_coproc_set_v2_beacon(cybiko_radio_coproc_t *c,
+                                      cybiko_radio_beacon_fn fn, void *user);
+
+void cybiko_radio_coproc_receive(cybiko_radio_coproc_t *c, uint8_t value);
+void cybiko_radio_coproc_handle_transmit(cybiko_radio_coproc_t *c,
+                                        const uint8_t *data, size_t len);
+int  cybiko_radio_coproc_complete_tx_dtc(cybiko_radio_coproc_t *c);
+void cybiko_radio_coproc_prepare_rx(cybiko_radio_coproc_t *c, int count);
+int  cybiko_radio_coproc_try_async(cybiko_radio_coproc_t *c);
+void cybiko_radio_coproc_v1_tx_complete(cybiko_radio_coproc_t *c);
+
+void cybiko_radio_coproc_queue_response(cybiko_radio_coproc_t *c, uint8_t value);
+int  cybiko_radio_coproc_read(cybiko_radio_coproc_t *c);
+int  cybiko_radio_coproc_rx_count(const cybiko_radio_coproc_t *c);
+int  cybiko_radio_coproc_pending(const cybiko_radio_coproc_t *c);
+const cybiko_radio_frame_t *cybiko_radio_coproc_peek(const cybiko_radio_coproc_t *c, int index);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

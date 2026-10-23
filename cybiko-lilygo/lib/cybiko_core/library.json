@@ -1,0 +1,8 @@
+{
+  "name": "cybiko_core",
+  "version": "1.0.0",
+  "build": {
+    "flags": ["-Isrc", "-O3", "-fjump-tables", "-ftree-switch-conversion", "-fno-stack-protector"],
+    "srcFilter": ["+<cybiko_core_unity.c>"]
+  }
+}

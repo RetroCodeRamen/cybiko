@@ -1,0 +1,29 @@
+# CyOS dumps and device saves stay on the card, not in git.
+roms/
+cybikov1.zip
+*.bin
+*.nvram
+*.flash
+save.tmp
+
+# Nested upstream .git directories, kept locally so history is not lost.
+.git.upstream/
+
+# Build and IDE
+.pio/
+build/
+build-sdl/
+.gradle/
+*.o
+*.d
+*.class
+*.iml
+*.iws
+*.ipr
+.cache/
+compile_commands.json
+.vscode/
+.claude/
+.idea/
+*.swp
+*~

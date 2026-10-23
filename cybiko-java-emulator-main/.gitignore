@@ -1,0 +1,14 @@
+build/
+
+*.iml
+*.iws
+*.ipr
+
+// Ignore CybikoXT resource files
+**/src/main/resources/cybikoxt*
+
+.gradle/
+
+*.nvram
+*.class
+*.bin

@@ -1,0 +1,7 @@
+build/
+roms/*.bin
+roms/*.nvram
+*.o
+*.d
+.cache/
+compile_commands.json

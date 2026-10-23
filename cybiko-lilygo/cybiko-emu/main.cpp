@@ -1,0 +1,1230 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <driver/i2s.h>
+#include <Preferences.h>
+#include <esp_timer.h>
+#include <string.h>
+#include <algorithm>
+
+#include "tdeck_pins.h"
+
+extern "C" {
+#include "core/emulator.h"
+#include "core/cfs.h"
+#include "radio_link.h"
+#include "radio_coproc.h"
+}
+
+#include "tdeck_keymap.h"
+#include "radio_sx1262.h"
+
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+static TFT_eSPI tft;
+static uint16_t *disp_buf;  // 320x200 RGB565 in PSRAM
+static uint32_t blit_count = 0;
+static unsigned long emu_started_ms = 0;
+
+// Loading phase: only every 20th frame is drawn, and silent frames are
+// fast-forwarded (hal_audio_output). It ends when CyOS has idled (asleep
+// >= 60% for three 60-frame windows in a row; boot dips quiet for a second
+// at a time, the settled desktop is ~67%), on the first key press, or after
+// 3 minutes. The keyboard is read throughout: ignoring it here left the
+// Classic's desktop looking frozen for up to two minutes.
+static bool boot_done;
+
+static bool boot_unpacking(void) {
+    if (boot_done || emu_started_ms == 0)
+        return false;
+    if (millis() - emu_started_ms >= 180000ul)
+        boot_done = true;
+    return !boot_done;
+}
+
+static void check_boot_done(const cybiko_stats_t *st) {
+    static uint64_t last_sleep;
+    static uint32_t last_frames;
+    if (boot_done) return;
+    uint32_t frames = st->frames - last_frames;
+    if (frames < 60) return;
+    uint64_t slept = st->sleep_cycles - last_sleep;
+    last_sleep = st->sleep_cycles;
+    last_frames = st->frames;
+    static int idle_windows;
+    if (slept * 10 >= (uint64_t)frames * CYBIKO_CYCLES_PER_FRAME * 6)
+        idle_windows++;
+    else
+        idle_windows = 0;
+    if (idle_windows >= 3) {
+        boot_done = true;
+        Serial.printf("CyOS idle: loading phase over at %lu ms\n",
+                      (unsigned long)(millis() - emu_started_ms));
+    }
+}
+
+// Precomputed grayscale -> RGB565 lookup (256 entries)
+static uint16_t gray_lut[256];
+
+static void init_gray_lut(void) {
+    for (int i = 0; i < 256; i++) {
+        // Proper grayscale: keep R=B in lock-step, G = R*2 for balanced gray
+        uint16_t v5 = (i >> 3) & 0x1F;   // 5-bit for R and B
+        uint16_t v6 = v5 << 1;            // 6-bit for G (exact 2x ratio)
+        gray_lut[i] = (v5 << 11) | (v6 << 5) | v5;
+    }
+}
+
+static uint32_t render_us;  // time inside hal_render_frame, reset per report
+
+static void render_frame_body(const uint8_t *pixels, int w, int h);
+
+static void hal_render_frame(void *ctx, const uint8_t *pixels, int w, int h) {
+    (void)ctx;
+    uint32_t t0 = micros();
+    render_frame_body(pixels, w, h);
+    render_us += micros() - t0;
+}
+
+// The SX1262 shares SPI with the panel. Radio transfers wait until the
+// previous frame's DMA has finished; the driver retries on a later poll.
+static bool tdeck_bus_free(void) {
+    return !tft.dmaBusy();
+}
+
+// Last frame sent to the panel. CyOS redraws rarely, and an unchanged
+// frame costs a 128 KB upscale and a ~13 ms DMA for nothing.
+static uint8_t shown_frame[160 * 100];
+static bool shown_valid = false;
+
+static void render_frame_body(const uint8_t *pixels, int w, int h) {
+    /* The 320x200 DMA blit is ~13 ms. If it is still running, skip this
+     * frame; shown_frame is not updated, so a change is drawn next time. */
+    if (tft.dmaBusy())
+        return;
+    if (boot_unpacking() && (++blit_count % 20) != 1)
+        return;
+    size_t n = (size_t)w * h;
+    if (n > sizeof shown_frame)
+        n = sizeof shown_frame;
+    if (shown_valid && memcmp(shown_frame, pixels, n) == 0)
+        return;
+    memcpy(shown_frame, pixels, n);
+    shown_valid = true;
+
+    // 2x nearest-neighbor upscale: 160x100 -> 320x200
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src_row = pixels + y * w;
+        uint16_t *dst_row0 = disp_buf + (y * 2) * SCALED_W;
+        uint16_t *dst_row1 = dst_row0 + SCALED_W;
+        for (int x = 0; x < w; x++) {
+            uint16_t c = gray_lut[src_row[x]];
+            dst_row0[x * 2]     = c;
+            dst_row0[x * 2 + 1] = c;
+            dst_row1[x * 2]     = c;
+            dst_row1[x * 2 + 1] = c;
+        }
+    }
+    tft.startWrite();
+    tft.pushImageDMA(0, BORDER_TOP, SCALED_W, SCALED_H, disp_buf);
+    tft.endWrite();
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard - ASCII to Cybiko matrix conversion
+// ---------------------------------------------------------------------------
+
+// Synthetic key release tracking
+#define MAX_ACTIVE_KEYS 8
+#define KEY_HOLD_FRAMES 4  // ~67ms at 60fps
+
+static uint16_t key_matrix[CYBIKO_KEYBOARD_COLUMNS];
+
+static struct {
+    int      col;
+    uint16_t mask;
+    int      frames_left;
+} active_keys[MAX_ACTIVE_KEYS];
+static int active_key_count = 0;
+
+// Fn+digit two-phase state machine
+static struct {
+    int      letter_col;
+    uint16_t letter_mask;
+    int      delay_frames;
+} pending_fn;
+static bool fn_pending = false;
+
+static void press_key(int col, uint16_t mask) {
+    for (int i = 0; i < active_key_count; i++) {
+        if (active_keys[i].col == col && active_keys[i].mask == mask) {
+            active_keys[i].frames_left = KEY_HOLD_FRAMES;
+            return;
+        }
+    }
+    if (active_key_count < MAX_ACTIVE_KEYS) {
+        active_keys[active_key_count].col = col;
+        active_keys[active_key_count].mask = mask;
+        active_keys[active_key_count].frames_left = KEY_HOLD_FRAMES;
+        active_key_count++;
+    }
+    key_matrix[col] |= mask;
+}
+
+static void keyboard_tick_frame(void) {
+    for (int i = 0; i < active_key_count; ) {
+        active_keys[i].frames_left--;
+        if (active_keys[i].frames_left <= 0) {
+            key_matrix[active_keys[i].col] &= ~active_keys[i].mask;
+            active_keys[i] = active_keys[active_key_count - 1];
+            active_key_count--;
+        } else {
+            i++;
+        }
+    }
+    if (fn_pending) {
+        pending_fn.delay_frames--;
+        if (pending_fn.delay_frames <= 0) {
+            press_key(pending_fn.letter_col, pending_fn.letter_mask);
+            fn_pending = false;
+        }
+    }
+}
+
+static void process_ascii_key(char c) {
+    tdeck_key_event_t ev;
+    if (!tdeck_map_ascii(c, &ev)) return;
+
+    if (ev.needs_fn) {
+        press_key(ev.col, ev.mask);
+        pending_fn.letter_col = ev.fn_col;
+        pending_fn.letter_mask = ev.fn_mask;
+        pending_fn.delay_frames = 3;
+        fn_pending = true;
+    } else {
+        if (ev.needs_shift)
+            press_key(TDECK_SHIFT_COL, TDECK_SHIFT_MASK);
+        press_key(ev.col, ev.mask);
+    }
+}
+
+// Trackball pulse counting via interrupts.
+// The trackball generates brief LOW pulses per step — too short to
+// reliably catch by polling at ~20fps.  ISRs count every pulse, then
+// poll_input() converts accumulated counts into synthetic held presses.
+static volatile int tb_up_count    = 0;
+static volatile int tb_down_count  = 0;
+static volatile int tb_left_count  = 0;
+static volatile int tb_right_count = 0;
+
+static void IRAM_ATTR tb_up_isr()    { tb_up_count++; }
+static void IRAM_ATTR tb_down_isr()  { tb_down_count++; }
+static void IRAM_ATTR tb_left_isr()  { tb_left_count++; }
+static void IRAM_ATTR tb_right_isr() { tb_right_count++; }
+
+static void init_trackball_interrupts(void) {
+    attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_UP),    tb_up_isr,    FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_DOWN),  tb_down_isr,  FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_LEFT),  tb_left_isr,  FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_RIGHT), tb_right_isr, FALLING);
+}
+
+#ifdef CYBIKO_SPLIT_PROFILE
+extern "C" uint32_t cybiko_split[3];
+#endif
+static void volume_step(void);
+
+static void press_special(tdeck_special_key_t k) {
+    int col; uint16_t mask;
+    if (tdeck_map_special(k, &col, &mask))
+        press_key(col, mask);
+}
+
+// The T-Deck has no Esc, F1-F7, Help, Select, Insert or Delete. $ is a
+// command key: $ then a letter sends one of them ($x = Esc). Shift+$
+// (code 4) and $v step the volume.
+static bool cmd_pending;
+
+static void show_cmd(bool on) {
+    tft.dmaWait();
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(on ? "$ cmd" : "     ", 270, 2, 2);
+}
+
+static void handle_key(char c) {
+    boot_done = true;   // someone is using it: back to real time
+    if (cmd_pending) {
+        cmd_pending = false;
+        show_cmd(false);
+        switch (c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c) {
+        case 'x': press_special(TDECK_KEY_ESC); break;
+        case 'h': press_special(TDECK_KEY_HELP); break;
+        case 's': press_special(TDECK_KEY_SELECT); break;
+        case 'i': press_special(TDECK_KEY_INSERT); break;
+        case 'd': press_special(TDECK_KEY_DELETE); break;
+        case 'g': press_special(TDECK_KEY_TAB); break;
+        case 'q': press_special(TDECK_KEY_F1); break;
+        case 'w': press_special(TDECK_KEY_F2); break;
+        case 'e': press_special(TDECK_KEY_F3); break;
+        case 'r': press_special(TDECK_KEY_F4); break;
+        case 't': press_special(TDECK_KEY_F5); break;
+        case 'y': press_special(TDECK_KEY_F6); break;
+        case 'u': press_special(TDECK_KEY_F7); break;
+        case 'v': volume_step(); break;
+        case '$': process_ascii_key('$'); break;
+        default: break;   // anything else cancels
+        }
+        return;
+    }
+    if (c == '$') {
+        cmd_pending = true;
+        show_cmd(true);
+    } else if (c == 0x04) {
+        volume_step();
+    } else {
+        process_ascii_key(c);
+    }
+}
+
+static void poll_input(void) {
+    {
+        Wire.requestFrom(KB_I2C_ADDR, (int)1);
+        while (Wire.available() > 0) {
+            char c = Wire.read();
+            if (c != 0x00) {
+                static int kb_log = 0;
+#ifdef CYBIKO_KEYLOG
+                // Every byte the keyboard sends, for mapping spare keys
+                Serial.printf("KEY 0x%02X %3u '%c'\n", (unsigned char)c, (unsigned char)c,
+                              c >= 0x20 && c < 0x7F ? c : '.');
+#else
+                if (kb_log < 16) {
+                    Serial.printf("kb %02X\n", (unsigned char)c);
+                    kb_log++;
+                }
+#endif
+                handle_key(c);
+            }
+        }
+    }
+
+    // Keys from the USB serial port, for scripted tests: ASCII as from the
+    // T-Deck keyboard, and 0x11-0x14 for trackball up/down/left/right.
+    while (Serial.available() > 0) {
+        int c = Serial.read();
+        switch (c) {
+        case 0x11: press_key(TDECK_PAD_UP_COL, TDECK_PAD_UP_MASK); break;
+        case 0x12: press_key(TDECK_PAD_DOWN_COL, TDECK_PAD_DOWN_MASK); break;
+        case 0x13: press_key(TDECK_PAD_LEFT_COL, TDECK_PAD_LEFT_MASK); break;
+        case 0x14: press_key(TDECK_PAD_RIGHT_COL, TDECK_PAD_RIGHT_MASK); break;
+        default:   if (c > 0) handle_key((char)c); break;
+        }
+    }
+
+    // Trackball: read and clear pulse counters (atomic via noInterrupts)
+    noInterrupts();
+    int up    = tb_up_count;    tb_up_count    = 0;
+    int down  = tb_down_count;  tb_down_count  = 0;
+    int left  = tb_left_count;  tb_left_count  = 0;
+    int right = tb_right_count; tb_right_count = 0;
+    interrupts();
+
+    // Convert pulses into synthetic held key presses
+    if (up > 0)    press_key(TDECK_PAD_UP_COL, TDECK_PAD_UP_MASK);
+    if (down > 0)  press_key(TDECK_PAD_DOWN_COL, TDECK_PAD_DOWN_MASK);
+    if (left > 0)  press_key(TDECK_PAD_LEFT_COL, TDECK_PAD_LEFT_MASK);
+    if (right > 0) press_key(TDECK_PAD_RIGHT_COL, TDECK_PAD_RIGHT_MASK);
+
+    /* A click is Enter, the key CyOS uses to leave the welcome pages and
+     * to open an icon (Select does not launch). Holding the ball down for
+     * half a second is Esc, which the T-Deck keyboard lacks. Enter is sent
+     * on release so a hold does not also open something. */
+    static uint32_t click_since;
+    static bool esc_sent;
+    bool clicked = !digitalRead(PIN_TRACKBALL_CLICK);
+    uint32_t now = millis();
+    if (clicked) {
+        if (!click_since) {
+            click_since = now ? now : 1;
+            esc_sent = false;
+        } else if (!esc_sent && now - click_since >= 500) {
+            press_special(TDECK_KEY_ESC);
+            esc_sent = true;
+        }
+    } else if (click_since) {
+        if (!esc_sent)
+            press_key(TDECK_ENTER_COL, TDECK_ENTER_MASK);
+        click_since = 0;
+    }
+}
+
+static void hal_keyboard_poll(void *ctx, uint16_t *matrix, int num_cols) {
+    (void)ctx;
+    int cols = (num_cols < CYBIKO_KEYBOARD_COLUMNS) ? num_cols : CYBIKO_KEYBOARD_COLUMNS;
+    memcpy(matrix, key_matrix, cols * sizeof(uint16_t));
+}
+
+// ---------------------------------------------------------------------------
+// Audio - I2S output
+// ---------------------------------------------------------------------------
+
+#define I2S_PORT       I2S_NUM_0
+#define I2S_SAMPLE_RATE 48000
+// Each frame writes 800 samples (16.7 ms) and waits for room, so the I2S
+// clock paces the emulator (see pace_frame). The queue is what absorbs a
+// run of slow frames (CyOS redrawing on every key press); its length is
+// also how far sound lags the screen. CYBIKO_AUDIO_BUFS x 400 samples.
+#ifndef CYBIKO_AUDIO_BUFS
+#define CYBIKO_AUDIO_BUFS 18   // 150 ms: rapid screen changes gave 0 gaps
+#endif
+#define I2S_DMA_BUF_COUNT CYBIKO_AUDIO_BUFS
+#define I2S_DMA_BUF_LEN   400
+
+static bool i2s_initialized = false;
+static QueueHandle_t i2s_events;
+static uint32_t i2s_underruns;  // DMA ran dry: an audible gap
+
+// The T-Deck has no volume knob. Shift+$ steps through these; the choice
+// is kept in NVS. Full scale was too loud on the T-Deck's amplifier.
+static const uint16_t VOLUME_Q8[] = { 256, 128, 64, 32, 0 };
+#define VOLUME_STEPS (sizeof VOLUME_Q8 / sizeof VOLUME_Q8[0])
+#define VOLUME_DEFAULT 1   // 50%
+static uint8_t volume_idx = VOLUME_DEFAULT;
+
+static void volume_load(void) {
+    Preferences p;
+    p.begin("cybiko", true);
+    volume_idx = p.getUChar("vol", VOLUME_DEFAULT);
+    p.end();
+    if (volume_idx >= VOLUME_STEPS) volume_idx = VOLUME_DEFAULT;
+}
+
+static void volume_step(void) {
+    volume_idx = (volume_idx + 1) % VOLUME_STEPS;
+    Preferences p;
+    p.begin("cybiko", false);
+    p.putUChar("vol", volume_idx);
+    p.end();
+    char note[24];
+    if (VOLUME_Q8[volume_idx])
+        snprintf(note, sizeof note, "volume %u%%   ", VOLUME_Q8[volume_idx] * 100 / 256);
+    else
+        snprintf(note, sizeof note, "volume off   ");
+    tft.dmaWait();
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(note, 200, 2, 2);
+    Serial.printf("%s\n", note);
+}
+
+static void init_i2s(void) {
+    i2s_config_t cfg = {};
+    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate = I2S_SAMPLE_RATE;
+    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count = I2S_DMA_BUF_COUNT;
+    cfg.dma_buf_len = I2S_DMA_BUF_LEN;
+    cfg.use_apll = false;
+    cfg.tx_desc_auto_clear = true;
+
+    if (i2s_driver_install(I2S_PORT, &cfg, 8, &i2s_events) != ESP_OK) {
+        Serial.println("I2S driver install failed");
+        return;
+    }
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num = PIN_I2S_BCK;
+    pins.ws_io_num = PIN_I2S_WS;
+    pins.data_out_num = PIN_I2S_DOUT;
+    pins.data_in_num = I2S_PIN_NO_CHANGE;
+
+    if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) {
+        Serial.println("I2S set pin failed");
+        return;
+    }
+
+    i2s_initialized = true;
+    volume_load();
+}
+
+static void count_i2s_underruns(void) {
+    i2s_event_t ev;
+    while (i2s_events && xQueueReceive(i2s_events, &ev, 0) == pdTRUE)
+        if (ev.type == I2S_EVENT_TX_Q_OVF)
+            i2s_underruns++;
+}
+
+static int16_t i2s_conv_buf[1024];
+static uint32_t audio_wait_us;  // time blocked in i2s_write, this frame
+static bool boot_unpacking(void);
+
+static void hal_audio_output(void *ctx, const uint8_t *samples, int count) {
+    (void)ctx;
+    if (!i2s_initialized || count <= 0) return;
+
+    int n = (count > 1024) ? 1024 : count;
+    int gain = VOLUME_Q8[volume_idx];   // 256 = the old full level
+    bool silent = true;
+    for (int i = 0; i < n; i++) {
+        silent &= samples[i] == 128;
+        i2s_conv_buf[i] = (int16_t)(((int)samples[i] - 128) * gain);
+    }
+
+    // Boot fast-forward: while CyOS is still loading, a silent frame does
+    // not wait for the audio clock, so boot runs as fast as the T-Deck can
+    // emulate instead of at 60 Hz. Silence that does not fit is dropped.
+    // A frame with sound waits as usual, so boot sounds stay intact.
+    if (silent && boot_unpacking()) {
+        size_t written = 0;
+        i2s_write(I2S_PORT, i2s_conv_buf, n * sizeof(int16_t), &written, 0);
+        return;
+    }
+
+    // Wait for room rather than drop samples. The I2S clock and
+    // esp_timer drift apart, and a non-blocking write lost a chunk every
+    // time the 42 ms queue filled, which was the choppy sound. Blocking
+    // here makes the I2S clock the frame clock. The timeout only guards
+    // against a stalled driver.
+    size_t bytes_written = 0;
+    uint32_t t0 = micros();
+    i2s_write(I2S_PORT, i2s_conv_buf, n * sizeof(int16_t), &bytes_written,
+              pdMS_TO_TICKS(100));
+    audio_wait_us += micros() - t0;
+}
+
+// ---------------------------------------------------------------------------
+// Serial output
+// ---------------------------------------------------------------------------
+
+static void hal_serial_output(void *ctx, uint8_t byte) {
+    (void)ctx;
+    Serial.write(byte);
+}
+
+// ---------------------------------------------------------------------------
+// SD card file loading
+// ---------------------------------------------------------------------------
+
+// One folder per machine, so the Classic and the Xtreme never share ROMs
+// or saves. The Classic saves its AT45DB041 image (CyOS plus the file
+// system); the Xtreme saves its 2 MB RAM, whose front is the file system.
+#ifdef CYBIKO_MACHINE_V1
+#define SD_DIR     "/cybiko-v1"
+#define SAVE_NAME  "save.flash"
+#else
+#define SD_DIR     "/cybiko"
+#define SAVE_NAME  "save.nvram"
+#endif
+#define SD_PATH(name) SD_DIR "/" name
+
+static uint8_t *load_sd_file(const char *path, size_t *out_size) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        Serial.printf("Failed to open %s\n", path);
+        return NULL;
+    }
+    size_t sz = f.size();
+    uint8_t *buf = (uint8_t *)ps_malloc(sz);
+    if (!buf) {
+        Serial.printf("Failed to allocate %u bytes for %s\n", (unsigned)sz, path);
+        f.close();
+        return NULL;
+    }
+    size_t rd = f.read(buf, sz);
+    f.close();
+    if (rd != sz) {
+        Serial.printf("Short read on %s: %u/%u\n", path, (unsigned)rd, (unsigned)sz);
+        free(buf);
+        return NULL;
+    }
+    *out_size = sz;
+    Serial.printf("Loaded %s (%u bytes)\n", path, (unsigned)sz);
+    return buf;
+}
+
+// NVRAM save — only every 5 minutes, with hash check to skip unchanged data
+static uint32_t last_nvram_hash = 0;
+
+static uint32_t simple_hash(const uint8_t *data, size_t len) {
+    // FNV-1a hash on a sample of the data (every 256th byte for speed)
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i += 256) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+#ifndef CYBIKO_MACHINE_V1
+static bool ends_with_app(const char *name) {
+    size_t n = strlen(name);
+    return n >= 4 && strcmp(name + n - 4, ".app") == 0;
+}
+
+/* Copy /cybiko/apps/*.app into the CFS image at the front of NVRAM.
+ * A name already stored is left alone, so a reboot does not add it again.
+ * Returns the buffer setup() should load. The caller frees it. */
+static uint8_t *inject_sd_apps(uint8_t *nvram, size_t *nvram_size) {
+    File dir = SD.open(SD_PATH("apps"));
+    if (!dir)
+        return nvram;
+    if (!dir.isDirectory()) {
+        dir.close();
+        return nvram;
+    }
+
+    cfs_image_t *img = (cfs_image_t *)ps_malloc(sizeof(cfs_image_t));
+    if (!img) {
+        Serial.println("apps: no room for the filesystem image");
+        dir.close();
+        return nvram;
+    }
+
+    bool existing = nvram && *nvram_size >= CFS_IMAGE_SIZE;
+    if (existing)
+        memcpy(img->data, nvram, CFS_IMAGE_SIZE);
+    else
+        cfs_format(img);
+
+    int added = 0;
+    File entry = dir.openNextFile();
+    while (entry) {
+        const char *full = entry.name();
+        const char *base = strrchr(full, '/');
+        base = base ? base + 1 : full;
+        bool take = !entry.isDirectory() && base[0] != '.' && ends_with_app(base);
+        if (take && strlen(base) > 58) {
+            Serial.printf("App name too long: %s\n", base);
+            take = false;
+        }
+        if (take && cfs_has_file(img, base)) {
+            Serial.printf("App already stored: %s\n", base);
+            take = false;
+        }
+        if (take) {
+            size_t sz = entry.size();
+            uint8_t *buf = (uint8_t *)ps_malloc(sz > 0 ? sz : 1);
+            size_t rd = buf ? entry.read(buf, sz) : 0;
+            if (buf && rd == sz && cfs_add_file(img, base, buf, sz)) {
+                Serial.printf("Added app %s (%u bytes)\n", base, (unsigned)sz);
+                added++;
+            } else {
+                Serial.printf("Could not add app %s\n", base);
+            }
+            free(buf);
+        }
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+
+    if (added == 0) {
+        free(img);
+        return nvram;
+    }
+    if (existing) {
+        memcpy(nvram, img->data, CFS_IMAGE_SIZE);
+        free(img);
+        Serial.printf("Stored %d new app(s) into the existing save\n", added);
+        return nvram;
+    }
+
+    uint8_t *fresh = (uint8_t *)ps_malloc(CFS_IMAGE_SIZE);
+    if (!fresh) {
+        Serial.println("apps: could not allocate a new save image");
+        free(img);
+        return nvram;
+    }
+    memcpy(fresh, img->data, CFS_IMAGE_SIZE);
+    free(img);
+    free(nvram);
+    *nvram_size = CFS_IMAGE_SIZE;
+    Serial.printf("Stored %d app(s) into a new filesystem image\n", added);
+    return fresh;
+}
+#endif
+
+static void save_nvram(cybiko_emu_t *emu) {
+    size_t len = 0;
+#ifdef CYBIKO_MACHINE_V1
+    // Skip unless CyOS programmed a flash page since the last save. A
+    // sampled hash would miss a 264-byte page.
+    uint32_t writes = 0;
+    const uint8_t *data = cybiko_get_spi_flash(emu, &len, &writes);
+    if (!data || len == 0) return;
+    if (writes == last_nvram_hash) return;
+    last_nvram_hash = writes;
+#else
+    const uint8_t *data = cybiko_get_nvram(emu, &len);
+    if (!data || len == 0) return;
+
+    // Skip save if data hasn't changed
+    uint32_t hash = simple_hash(data, len);
+    if (hash == last_nvram_hash) return;
+    last_nvram_hash = hash;
+#endif
+
+    // The card shares SPI with the panel: never start while a frame's DMA
+    // is still running. Write a temp file and only replace the save once
+    // every byte is on the card. Opening save.nvram for writing truncates
+    // it, and an interrupted 2 MB write used to leave a short or empty file.
+    tft.dmaWait();
+    uint32_t t0 = millis();
+    File f = SD.open(SD_PATH("save.tmp"), FILE_WRITE);
+    if (!f) {
+        Serial.println("NVRAM save failed: cannot open save.tmp");
+        last_nvram_hash = 0;
+        return;
+    }
+    // 4 KB at a time through an internal buffer, so a short write shows
+    // where it stopped.
+    static uint8_t chunk[4096];
+    size_t wrote = 0;
+    while (wrote < len) {
+        size_t n = len - wrote < sizeof chunk ? len - wrote : sizeof chunk;
+        memcpy(chunk, data + wrote, n);
+        size_t w = f.write(chunk, n);
+        wrote += w;
+        if (w != n)
+            break;
+    }
+    f.close();
+    if (wrote != len) {
+        Serial.printf("NVRAM save failed: %u of %u bytes, old save kept\n",
+                      (unsigned)wrote, (unsigned)len);
+        SD.remove(SD_PATH("save.tmp"));
+        last_nvram_hash = 0;  // try again next interval
+        return;
+    }
+    SD.remove(SD_PATH(SAVE_NAME));
+    if (!SD.rename(SD_PATH("save.tmp"), SD_PATH(SAVE_NAME))) {
+        Serial.println("NVRAM save failed: rename, data is in save.tmp");
+        last_nvram_hash = 0;
+        return;
+    }
+    Serial.printf("NVRAM saved (%u bytes, %lu ms)\n", (unsigned)len,
+                  (unsigned long)(millis() - t0));
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+static cybiko_emu_t *emu = NULL;
+static uint32_t frame_count = 0;
+static unsigned long last_nvram_save_ms = 0;
+static unsigned long last_fps_report = 0;
+static uint32_t frame_us = 0;
+static cybiko_stats_t last_stats = {};
+#ifndef NVRAM_SAVE_INTERVAL_MS
+#define NVRAM_SAVE_INTERVAL_MS 300000  // 5 minutes
+#endif
+#define FPS_REPORT_INTERVAL_MS 5000
+
+#ifdef CYBIKO_DIAG_SPI
+// Shared-bus check: an SD write and an SX1262 status read, run before and
+// after TFT_eSPI takes the SPI host for DMA.
+static void diag_spi(const char *when) {
+    static uint8_t buf[4096];
+    memset(buf, 0xA5, sizeof buf);
+    File f = SD.open("/cybiko/diag.tmp", FILE_WRITE);
+    size_t wrote = 0;
+    if (f) {
+        for (int i = 0; i < 16; i++) {
+            size_t w = f.write(buf, sizeof buf);
+            wrote += w;
+            if (w != sizeof buf) break;
+        }
+        f.close();
+    }
+    SD.remove("/cybiko/diag.tmp");
+    Serial.printf("DIAG %s: SD wrote %u/65536, radio status %d\n", when,
+                  (unsigned)wrote, cybiko_sx1262_phy_probe());
+}
+#endif
+
+void setup() {
+    Serial.begin(115200);
+    // Never wait on the USB host. HWCDC switches to a 100 ms timeout once a
+    // host has been seen; after unplugging, or with the cable in and no
+    // terminal reading, every write then stalled until it timed out. CyOS
+    // console output goes out one byte at a time, so the emulator froze
+    // and looked crashed. Unread output is dropped instead.
+    Serial.setTxTimeoutMs(0);
+    Serial.printf("Reset reason %d\n", (int)esp_reset_reason());
+
+    int radio_check = cybiko_link_self_check();
+    if (radio_check == 0)
+        Serial.println("Radio codec self-check ok");
+    else
+        Serial.printf("Radio codec self-check failed: %d\n", radio_check);
+
+    // Enable peripheral power
+    pinMode(PIN_POWER_ON, OUTPUT);
+    digitalWrite(PIN_POWER_ON, HIGH);
+
+    // Deselect all SPI devices
+    pinMode(PIN_TFT_CS, OUTPUT);
+    digitalWrite(PIN_TFT_CS, HIGH);
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+    pinMode(PIN_RADIO_CS, OUTPUT);
+    digitalWrite(PIN_RADIO_CS, HIGH);
+    pinMode(PIN_RADIO_RST, OUTPUT);
+    digitalWrite(PIN_RADIO_RST, HIGH);
+    pinMode(PIN_RADIO_BUSY, INPUT);
+    pinMode(PIN_RADIO_DIO1, INPUT);
+
+    // Init SPI bus
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+
+    // Init I2C with keyboard startup delay
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+    delay(500);
+
+    // Init TFT
+    tft.init();
+    tft.setRotation(1);  // Landscape
+    tft.setSwapBytes(true);  // ESP32 is little-endian, ST7789 expects big-endian
+    tft.fillScreen(TFT_BLACK);
+    pinMode(PIN_TFT_BL, OUTPUT);
+    digitalWrite(PIN_TFT_BL, HIGH);
+
+    // Display buffer: internal DMA-capable SRAM if a 128 KB block is free,
+    // so the per-frame upscale does not stream through the PSRAM cache that
+    // the guest's 2 MB RAM and flash image depend on. PSRAM otherwise.
+    Serial.printf("Internal heap: %u free, largest DMA block %u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    disp_buf = (uint16_t *)heap_caps_malloc(SCALED_W * SCALED_H * sizeof(uint16_t),
+                                            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    Serial.printf("Display buffer in %s\n", disp_buf ? "internal SRAM" : "PSRAM");
+    if (!disp_buf)
+        disp_buf = (uint16_t *)ps_malloc(SCALED_W * SCALED_H * sizeof(uint16_t));
+    if (!disp_buf) {
+        Serial.println("FATAL: Failed to allocate display buffer in PSRAM");
+        while (1) delay(1000);
+    }
+    memset(disp_buf, 0, SCALED_W * SCALED_H * sizeof(uint16_t));
+    init_gray_lut();
+
+    int radio_rc = cybiko_sx1262_begin(tdeck_bus_free);
+    Serial.printf("SX1262 begin %d status=0x%02X errors=0x%04X %s\n",
+                  radio_rc, cybiko_sx1262_chip_status(),
+                  cybiko_sx1262_device_errors(), cybiko_sx1262_last_error());
+    tft.setTextColor(radio_rc == 0 ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    char radio_line[48];
+    snprintf(radio_line, sizeof radio_line, "SX1262 %s  st=%02X err=%04X",
+             cybiko_sx1262_last_error(), cybiko_sx1262_chip_status(),
+             cybiko_sx1262_device_errors());
+    tft.drawString(radio_line, 10, 10, 2);
+
+    // Init SD card
+#ifndef CYBIKO_SD_HZ
+#define CYBIKO_SD_HZ 20000000U  /* 800 kHz made writes stop after 12 KB */
+#endif
+    if (!SD.begin(PIN_SD_CS, SPI, CYBIKO_SD_HZ)) {
+        Serial.println("FATAL: SD card init failed");
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.drawString("SD card failed", 10, 30, 2);
+        tft.drawString("Need " SD_PATH("boot.bin"), 10, 50, 2);
+        tft.drawString("and " SD_PATH("flash.bin"), 10, 70, 2);
+        while (1) delay(1000);
+    }
+    Serial.printf("SD card initialized: %llu MB, %llu MB used\n",
+                  (unsigned long long)(SD.totalBytes() >> 20),
+                  (unsigned long long)(SD.usedBytes() >> 20));
+
+    // Init I2S audio
+    init_i2s();
+
+    // Init trackball GPIOs + interrupts for pulse counting
+    pinMode(PIN_TRACKBALL_UP, INPUT_PULLUP);
+    pinMode(PIN_TRACKBALL_DOWN, INPUT_PULLUP);
+    pinMode(PIN_TRACKBALL_LEFT, INPUT_PULLUP);
+    pinMode(PIN_TRACKBALL_RIGHT, INPUT_PULLUP);
+    pinMode(PIN_TRACKBALL_CLICK, INPUT_PULLUP);
+    init_trackball_interrupts();
+
+    // Init keyboard matrix
+    memset(key_matrix, 0, sizeof(key_matrix));
+
+    // Load ROMs from SD
+    size_t boot_size = 0, flash_size = 0;
+    uint8_t *boot_data = load_sd_file(SD_PATH("boot.bin"), &boot_size);
+#ifdef CYBIKO_MACHINE_V1
+    // The Classic's save is the whole flash chip; flash.bin is only the
+    // factory image used until the first save. Delete save.flash to reset.
+    uint8_t *flash_data = NULL;
+    if (SD.exists(SD_PATH(SAVE_NAME)))
+        flash_data = load_sd_file(SD_PATH(SAVE_NAME), &flash_size);
+    if (!flash_data)
+        flash_data = load_sd_file(SD_PATH("flash.bin"), &flash_size);
+#else
+    uint8_t *flash_data = load_sd_file(SD_PATH("flash.bin"), &flash_size);
+#endif
+
+    if (!boot_data || !flash_data) {
+        Serial.println("FATAL: Missing boot.bin or flash.bin on SD card");
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.drawString("Missing ROM files!", 10, 10, 2);
+        tft.drawString("Need " SD_PATH("boot.bin"), 10, 30, 2);
+        tft.drawString("and " SD_PATH("flash.bin"), 10, 50, 2);
+        while (1) delay(1000);
+    }
+
+    // Create emulator
+    cybiko_hal_t hal = {};
+    hal.render_frame = hal_render_frame;
+    hal.audio_output = hal_audio_output;
+    hal.keyboard_poll = hal_keyboard_poll;
+    hal.serial_output = hal_serial_output;
+    hal.ctx = NULL;
+
+    emu = cybiko_create(&hal);
+    if (!emu) {
+        Serial.println("FATAL: cybiko_create failed");
+        while (1) delay(1000);
+    }
+
+#ifdef CYBIKO_PSRAM_BENCH
+    Serial.printf("BENCH cpu %lu MHz, emu struct %s at %p, ext RAM %s\n",
+                  (unsigned long)getCpuFrequencyMhz(),
+                  esp_ptr_internal(emu) ? "internal" : "PSRAM", (void *)emu,
+                  esp_ptr_internal(cybiko_get_nvram(emu, NULL)) ? "internal" : "PSRAM");
+    {
+        volatile uint32_t x = 0;
+        uint32_t c0 = ESP.getCycleCount();
+        for (int i = 0; i < 10000; i++) x += i;
+        Serial.printf("BENCH plain C loop: %lu cycles/iteration\n",
+                      (unsigned long)((ESP.getCycleCount() - c0) / 10000));
+    }
+    // Fixed cost per instruction: straight-line NOPs and MOV.B #imm,R0L,
+    // 256 of each from on-chip RAM and from external RAM.
+    {
+        struct { const char *name; uint32_t at; uint8_t b0, b1; } st[] = {
+            { "nop   internal", 0xFFF000, 0x00, 0x00 },
+            { "nop   psram   ", 0x200000, 0x00, 0x00 },
+            { "movb  internal", 0xFFF000, 0xF8, 0x12 },
+            { "movb  psram   ", 0x200000, 0xF8, 0x12 },
+        };
+        for (auto &t : st) {
+            for (int i = 0; i < 256; i++) {
+                cybiko_poke8(emu, t.at + 2 * i, t.b0);
+                cybiko_poke8(emu, t.at + 2 * i + 1, t.b1);
+            }
+            uint32_t best = 0xFFFFFFFF;
+            for (int rep = 0; rep < 20; rep++) {
+                uint32_t c0 = ESP.getCycleCount();
+                cybiko_debug_run(emu, t.at, 256);
+                uint32_t c = ESP.getCycleCount() - c0;
+                if (c < best) best = c;
+            }
+            Serial.printf("BENCH %s %lu cycles/insn\n", t.name, (unsigned long)(best / 256));
+        }
+    }
+    // Interpreter cost with guest code and data in internal SRAM (on-chip
+    // RAM) against PSRAM (external RAM), sequential and 4 KB-strided reads.
+    {
+        static const uint8_t seq[] = {      // loop: 6 instructions
+            0x01,0x00,0x69,0x12,            // MOV.L @ER1, ER2
+            0x0A,0xA3,                      // ADD.L ER2, ER3
+            0x0B,0x91,                      // ADDS #4, ER1
+            0x1B,0x54,                      // DEC.W #1, R4
+            0x46,0xF6 };                    // BNE loop
+        static const uint8_t strided[] = {
+            0x01,0x00,0x69,0x12,            // MOV.L @ER1, ER2
+            0x0A,0xA3,                      // ADD.L ER2, ER3
+            0x7A,0x11,0x00,0x00,0x10,0x00,  // ADD.L #0x1000, ER1
+            0x1B,0x54,                      // DEC.W #1, R4
+            0x46,0xF2 };                    // BNE loop
+        struct { const char *name; uint32_t code, data; const uint8_t *prog; size_t len; } runs[] = {
+            { "internal seq ", 0xFFF000, 0xFFF100, seq, sizeof seq },
+            { "psram seq    ", 0x200000, 0x210000, seq, sizeof seq },
+            { "psram strided", 0x200000, 0x210000, strided, sizeof strided },
+        };
+        for (auto &r : runs) {
+            for (size_t i = 0; i < r.len; i++) cybiko_poke8(emu, r.code + i, r.prog[i]);
+            // MOV.L #data, ER1 ; MOV.W #count, R4 set through a prologue
+            uint8_t pro[] = { 0x7A,0x01,(uint8_t)(r.data>>24),(uint8_t)(r.data>>16),(uint8_t)(r.data>>8),(uint8_t)r.data,
+                              0x79,0x04,0x00,0x40 };   // R4 = 64 iterations
+            uint32_t pro_at = r.code - 0x20;
+            for (size_t i = 0; i < sizeof pro; i++) cybiko_poke8(emu, pro_at + i, pro[i]);
+            // jump from the prologue into the loop: BRA d8
+            cybiko_poke8(emu, pro_at + 10, 0x40);
+            cybiko_poke8(emu, pro_at + 11, (uint8_t)(r.code - (pro_at + 12)));
+            uint32_t best = 0xFFFFFFFF;
+            for (int rep = 0; rep < 20; rep++) {
+                uint32_t c0 = ESP.getCycleCount();
+                cybiko_debug_run(emu, pro_at, 3 + 64 * 5);
+                uint32_t c = ESP.getCycleCount() - c0;
+                if (c < best) best = c;
+            }
+            Serial.printf("BENCH %s %lu cycles/insn (best of 20)\n", r.name,
+                          (unsigned long)(best / (3 + 64 * 5)));
+            uint32_t total = 0;
+            for (int rep = 0; rep < 20; rep++) {
+                uint32_t c0 = ESP.getCycleCount();
+                cybiko_debug_run(emu, pro_at, 3 + 64 * 5);
+                total += ESP.getCycleCount() - c0;
+            }
+            Serial.printf("BENCH %s %lu cycles/insn (mean)\n", r.name,
+                          (unsigned long)(total / 20 / (3 + 64 * 5)));
+        }
+    }
+#endif
+    cybiko_load_boot_rom(emu, boot_data, boot_size);
+    cybiko_load_flash_rom(emu, flash_data, flash_size);
+#ifndef CYBIKO_MACHINE_V1
+    if (cybiko_sx1262_transport() && cybiko_patch_cyid(emu, cybiko_sx1262_device_id()))
+        Serial.printf("CyID %08lX\n", (unsigned long)cybiko_sx1262_device_id());
+#endif
+    free(boot_data);
+    free(flash_data);
+
+#ifdef CYBIKO_MACHINE_V1
+    {
+        uint32_t writes = 0;
+        cybiko_get_spi_flash(emu, NULL, &writes);
+        last_nvram_hash = writes;
+    }
+    // Classic radio (SCI0) over LoRa. The board's MAC-derived id is both
+    // the guest CyID (patched into RAM once CyOS loads) and the LoRa link
+    // sender, so every T-Deck on the air is a different Cybiko.
+    static cybiko_radio_coproc_t radio_cop;
+    if (cybiko_sx1262_transport()) {
+        cybiko_radio_coproc_init(&radio_cop);
+        cybiko_radio_coproc_set_transport(&radio_cop, cybiko_sx1262_transport());
+        cybiko_attach_radio_id(emu, &radio_cop, cybiko_sx1262_device_id());
+        Serial.printf("Classic radio on LoRa, CyID %08lX, TX %s\n",
+                      (unsigned long)cybiko_sx1262_device_id(),
+                      cybiko_sx1262_link()->tx_enabled ? "on" : "off");
+    }
+#else
+    // Load NVRAM if present, then add any new /cybiko/apps/*.app files.
+    size_t nvram_size = 0;
+    uint8_t *nvram_data = load_sd_file(SD_PATH(SAVE_NAME), &nvram_size);
+    nvram_data = inject_sd_apps(nvram_data, &nvram_size);
+    if (nvram_data) {
+        cybiko_load_nvram(emu, nvram_data, nvram_size);
+        // Set initial hash so we don't immediately re-save
+        last_nvram_hash = simple_hash(nvram_data, nvram_size);
+        free(nvram_data);
+    }
+
+    // Guest radio over the SX1262. Without CYBIKO_RADIO_TX the transport
+    // refuses sends and only receives. The Classic's radio is on SCI0,
+    // which is not emulated yet (PLAN-V1.md step 7).
+    static cybiko_radio_coproc_t radio_cop;
+    if (cybiko_sx1262_transport()) {
+        cybiko_radio_coproc_init(&radio_cop);
+        cybiko_radio_coproc_set_transport(&radio_cop, cybiko_sx1262_transport());
+        cybiko_attach_radio(emu, &radio_cop);
+        Serial.printf("Radio co-processor attached, TX %s\n",
+                      cybiko_sx1262_link()->tx_enabled ? "on" : "off");
+    }
+#endif
+
+    cybiko_reset(emu);
+
+    // Init DMA after SD card operations are complete (shared SPI bus)
+#ifdef CYBIKO_DIAG_SPI
+    diag_spi("before initDMA");
+#endif
+    tft.initDMA();
+#ifdef CYBIKO_DIAG_SPI
+    diag_spi("after initDMA");
+    static uint16_t diag_px[320 * 20];
+    tft.startWrite();
+    tft.pushImageDMA(0, 0, 320, 20, diag_px);
+    tft.endWrite();
+    tft.dmaWait();
+    diag_spi("after one DMA frame");
+#endif
+
+    last_nvram_save_ms = millis();
+    last_fps_report = millis();
+    emu_started_ms = millis();
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Loading CyOS can take a few minutes", 4, 2, 2);
+    Serial.println("Cybiko emulator started");
+}
+
+// Hold the guest to the real Cybiko's 60 Hz. Each frame is a fixed slice
+// of guest time (RTC ticks once per frame, keys hold for 4 frames, audio
+// is generated per frame), so running idle CyOS at 260 fps made all of
+// that 4x too fast. Frames that run late are not made up in a burst.
+static uint32_t pace_wait_us;  // time spent waiting, reset per report
+
+static void pace_frame(void) {
+    // With audio running, hal_audio_output already held this frame to the
+    // I2S rate; a second clock here would fight it.
+    if (i2s_initialized)
+        return;
+    static int64_t next_us3;  // deadline in 1/3 us: 60 Hz = 50000 per frame
+    int64_t now3 = esp_timer_get_time() * 3;
+    if (!next_us3)
+        next_us3 = now3;
+    next_us3 += 50000;
+    int64_t ahead3 = next_us3 - now3;
+    if (ahead3 <= 0) {
+        if (ahead3 < -3 * 50000)
+            next_us3 = now3;  // more than 3 frames behind: resync
+        return;
+    }
+    uint32_t ahead_us = (uint32_t)(ahead3 / 3);
+    pace_wait_us += ahead_us;
+    if (ahead_us > 2000)
+        vTaskDelay(pdMS_TO_TICKS((ahead_us - 1000) / 1000));
+    while (esp_timer_get_time() * 3 < next_us3) {
+    }
+}
+
+#ifdef CYBIKO_PROFILE
+// Top guest PCs (16-byte buckets) since the last report.
+static void report_pc_samples(void) {
+    static uint32_t pcs[CYBIKO_PC_SAMPLES];
+    int n = cybiko_take_pc_samples(emu, pcs, CYBIKO_PC_SAMPLES);
+    for (int i = 0; i < n; i++) pcs[i] &= ~0xFu;
+    std::sort(pcs, pcs + n);
+    uint32_t top_pc[8] = {}; int top_n[8] = {};
+    for (int i = 0; i < n;) {
+        int j = i;
+        while (j < n && pcs[j] == pcs[i]) j++;
+        int c = j - i;
+        for (int k = 0; k < 8; k++) {
+            if (c > top_n[k]) {
+                memmove(&top_pc[k + 1], &top_pc[k], (7 - k) * sizeof top_pc[0]);
+                memmove(&top_n[k + 1], &top_n[k], (7 - k) * sizeof top_n[0]);
+                top_pc[k] = pcs[i]; top_n[k] = c;
+                break;
+            }
+        }
+        i = j;
+    }
+    Serial.printf("  pc samples %d:", n);
+    for (int k = 0; k < 8 && top_n[k]; k++)
+        Serial.printf(" %06lX:%d", (unsigned long)top_pc[k], top_n[k]);
+    Serial.println();
+}
+#endif
+
+void loop() {
+    // Poll input
+    poll_input();
+    keyboard_tick_frame();
+
+    uint32_t t0 = micros();
+    audio_wait_us = 0;
+    cybiko_run_frame(emu);
+    // Time blocked on the audio queue is pacing, not emulation
+    frame_us += micros() - t0 - audio_wait_us;
+    pace_wait_us += audio_wait_us;
+    count_i2s_underruns();
+
+    cybiko_sx1262_pump();
+    if (!boot_done) {
+        cybiko_stats_t bst;
+        cybiko_get_stats(emu, &bst);
+        check_boot_done(&bst);
+    }
+
+    frame_count++;
+
+    // FPS reporting every 5 seconds
+    unsigned long now = millis();
+    if (now - last_fps_report >= FPS_REPORT_INTERVAL_MS) {
+        float elapsed_sec = (now - last_fps_report) / 1000.0f;
+        float fps = frame_count / elapsed_sec;
+        float speed_pct = (fps / 60.0f) * 100.0f;
+        // fps alone hides guest speed: with EMU_TIMER_STRIDE each frame
+        // carries a fixed cycle budget. Report guest instructions/s and
+        // host cycles per guest instruction for the time spent outside
+        // the display callback.
+        cybiko_stats_t st;
+        cybiko_get_stats(emu, &st);
+        uint64_t insns = st.instructions - last_stats.instructions;
+        uint64_t slept = st.sleep_cycles - last_stats.sleep_cycles;
+        uint32_t frames = st.frames - last_stats.frames;
+        uint32_t cpu_us = frame_us > render_us ? frame_us - render_us : 0;
+        float kips = insns / elapsed_sec / 1000.0f;
+        float cyc_per_insn = insns ? (cpu_us * 240.0f) / insns : 0.0f;
+        float sleep_pct = frames ? 100.0f * slept /
+            ((float)frames * CYBIKO_CYCLES_PER_FRAME) : 0.0f;
+        Serial.printf("%.1f fps (%.0f%%)  %.0f kIPS  %.0f cyc/insn  "
+                      "sleep %.0f%%  core %lu ms  render %lu ms  idle %lu ms  "
+                      "audio gaps %lu\n",
+                      fps, speed_pct, kips, cyc_per_insn, sleep_pct,
+                      (unsigned long)(cpu_us / 1000),
+                      (unsigned long)(render_us / 1000),
+                      (unsigned long)(pace_wait_us / 1000),
+                      (unsigned long)i2s_underruns);
+        i2s_underruns = 0;
+        pace_wait_us = 0;
+#ifdef CYBIKO_SPLIT_PROFILE
+        {
+            if (cybiko_split[2])
+                Serial.printf("  split: timers %lu cyc/insn, cpu %lu cyc/insn over %lu insns\n",
+                              (unsigned long)(cybiko_split[0] / cybiko_split[2]),
+                              (unsigned long)(cybiko_split[1] / cybiko_split[2]),
+                              (unsigned long)cybiko_split[2]);
+            cybiko_split[0] = cybiko_split[1] = cybiko_split[2] = 0;
+        }
+#endif
+#ifdef CYBIKO_MACHINE_V1
+        {
+            uint32_t fw = 0;
+            cybiko_get_spi_flash(emu, NULL, &fw);
+            cybiko_v1_radio_status_t rs;
+            if (cybiko_v1_radio_status(emu, &rs))
+                Serial.printf("  flash pages written %lu  classic radio: rf %s boot %s "
+                              "sent %lu delivered %lu\n", (unsigned long)fw,
+                              rs.rf_resolved ? "up" : (rs.rf_armed ? "armed" : "-"),
+                              rs.bootstrapped ? "yes" : "no",
+                              (unsigned long)rs.tx_frames, (unsigned long)rs.rx_injected);
+            else
+                Serial.printf("  flash pages written %lu\n", (unsigned long)fw);
+        }
+#endif
+        if (const cybiko_lora_t *lk = cybiko_sx1262_link()) {
+            const cybiko_sx1262_stats_t *rs = cybiko_sx1262_phy_stats();
+            Serial.printf("  radio rx %lu (crc %lu, link bad %lu, msgs %lu) "
+                          "tx %lu done %lu rejected %lu  rssi %d snr %d  bus waits %lu\n",
+                          (unsigned long)rs->rx_ok, (unsigned long)rs->rx_crc,
+                          (unsigned long)lk->stats.rx_bad, (unsigned long)lk->stats.rx_msgs,
+                          (unsigned long)lk->stats.tx_pkts, (unsigned long)rs->tx_done,
+                          (unsigned long)lk->stats.tx_rejected,
+                          rs->last_rssi_dbm, rs->last_snr_db,
+                          (unsigned long)rs->bus_waits);
+        }
+#ifdef CYBIKO_PROFILE
+        report_pc_samples();
+#endif
+        last_stats = st;
+        frame_us = 0;
+        render_us = 0;
+        char bar[40];
+        snprintf(bar, sizeof bar, "%.0f fps  %s", fps,
+                 boot_unpacking() ? "unpacking..." : "running");
+        tft.dmaWait();  // do not mix register writes with a DMA in flight
+        tft.fillRect(0, 0, SCALED_W, BORDER_TOP, TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.drawString(bar, 4, 2, 2);
+        frame_count = 0;
+        last_fps_report = now;
+    }
+
+    // Auto-save NVRAM every 5 minutes
+    if (now - last_nvram_save_ms >= NVRAM_SAVE_INTERVAL_MS) {
+        save_nvram(emu);
+        last_nvram_save_ms = now;
+    }
+
+    pace_frame();
+}
