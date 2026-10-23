@@ -1,15 +1,16 @@
-Cybiko ROM images are not included in this project.
+Classic (V1) dumps ship in the PC download:
 
-You need to provide your own Classic (V1) dumps:
+  https://github.com/RetroCodeRamen/cybiko/releases/tag/v1.1026.2b
 
-  boot.bin   Cybiko boot ROM, 32 KB (often named cyrom112.bin)
-  flash.bin  CyOS 1.2.46 flash image (often named flash_v1246.bin)
+  roms/boot.bin    32 KB boot ROM (cyrom112.bin)
+  roms/flash.bin   CyOS 1.2.46 (flash_v1246.bin)
 
-Place them next to the emulator as roms/boot.bin and roms/flash.bin,
-or pass the paths on the command line.
+Unzip and run. A git clone still does not contain the images — copy
+them from the zip, or pass paths on the command line.
 
-Dumps are often archived on the Internet Archive:
+Xtreme (XT) dumps are not in the download. For T-Deck XT you still
+need your own boot.bin (cyrom150.bin) and flash.bin (cyos_v1508.bin).
+
+Dumps also show up on the Internet Archive:
 
   https://archive.org/details/cybiko
-
-This project does not host CyOS or boot ROMs.

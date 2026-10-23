@@ -7,8 +7,8 @@
 <p align="center"><em>The original pocket computer. Still on the air.</em></p>
 
 <p align="center">
-  <strong>v1.1026.1b (beta)</strong> · October 2026 ·
-  <a href="https://github.com/RetroCodeRamen/cybiko/releases/tag/v1.1026.1b">Linux &amp; Windows builds</a>
+  <strong>v1.1026.2b (beta)</strong> · October 2026 ·
+  <a href="https://github.com/RetroCodeRamen/cybiko/releases/tag/v1.1026.2b">Linux &amp; Windows builds</a>
 </p>
 
 <p align="center">
@@ -23,20 +23,20 @@ This project does not recreate that vibe in a web app. **It boots the original C
 
 > Original guest. Modern hardware. Same cafeteria energy, slightly better RSSI.
 
-**Beta.** Testers welcome. Not a 1.0. ROM images are not in the download — you bring your own. They show up on the Internet Archive more often than you'd think: [archive.org/details/cybiko](https://archive.org/details/cybiko). See [GETTING-ROMS.txt](GETTING-ROMS.txt).
+**Beta.** Testers welcome. Not a 1.0. The zip now includes Classic CyOS 1.2.46 so you can unzip and run. A git clone still does not — see [GETTING-ROMS.txt](GETTING-ROMS.txt). Xtreme dumps stay off the download.
 
 ---
 
 ## Get it
 
-**[v1.1026.1b release](https://github.com/RetroCodeRamen/cybiko/releases/tag/v1.1026.1b)** — PC Classic emulator, no compiler.
+**[v1.1026.2b release](https://github.com/RetroCodeRamen/cybiko/releases/tag/v1.1026.2b)** — PC Classic emulator, CyOS included, no compiler.
 
 | File | What |
 | --- | --- |
-| `cybiko-v1.1026.1b-linux-x64.zip` | Linux (`libsdl2`, `libpng`, X11) |
-| `cybiko-v1.1026.1b-windows-x64.zip` | Windows (SDL2 bundled) |
+| `cybiko-v1.1026.2b-linux-x64.zip` | Linux (`libsdl2`, `libpng`, X11) |
+| `cybiko-v1.1026.2b-windows-x64.zip` | Windows (SDL2 bundled) |
 
-Drop Classic dumps in `roms/boot.bin` (32 KB boot ROM) and `roms/flash.bin` (CyOS 1.2.46), then `./run.sh` or `run.bat`.
+Unzip. `./run.sh` or `run.bat`. Classic boot ROM and CyOS 1.2.46 are already in `roms/`.
 
 Plug in a **Heltec WiFi LoRa 32 V3**. The emulator finds the CP2102 on its own. Right-click the device for Settings: shell color, 4× LCD zoom, always-on-top, and flash buttons for the Heltec radio firmware and a LilyGO T-Deck (those still want [PlatformIO](https://platformio.org/) and this source tree).
 
@@ -96,7 +96,7 @@ A passing `make test` is not a hardware result. A LoRa ping is not CyOS chat. Bo
 | `/cybiko-v1/flash.bin` | CyOS 1.2.46 (`flash_v1246.bin`) |
 | `/cybiko-v1/save.flash` | AT45DB041 image |
 
-ROMs and `.app` files stay off git on purpose.
+Classic dumps ride along in the zip. They stay out of git. XT dumps and `.app` files stay off both.
 
 ---
 
