@@ -29,10 +29,9 @@ static void report(const char *tag, int frame, cybiko_emu_t *e, const cybiko_rad
     cybiko_stats_t ss;
     cybiko_v1_radio_status(e, &st);
     cybiko_get_stats(e, &ss);
-    printf("frame %5d %s: rf %s%s boot %s  frames sent %u, coproc tx %u rx %u, delivered %u, ch %u"
+    printf("frame %5d %s: radio %s  frames sent %u, coproc tx %u rx %u, delivered %u, ch %u"
            "  | %llu insns/frame, asleep %.0f%%\n",
-           frame, tag, st.rf_armed ? "armed" : "-", st.rf_resolved ? "+resolved" : "",
-           st.bootstrapped ? "yes" : "no", st.tx_frames, c->stat_tx, c->stat_rx,
+           frame, tag, st.radio_up ? "up" : "-", st.tx_frames, c->stat_tx, c->stat_rx,
            st.rx_injected, c->current_channel,
            (unsigned long long)((ss.instructions - last_insns[k]) / 600),
            100.0 * (double)(ss.sleep_cycles - last_sleep[k]) / (600.0 * CYBIKO_CYCLES_PER_FRAME));

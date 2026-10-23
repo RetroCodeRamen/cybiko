@@ -6,6 +6,9 @@
 #include <driver/i2s.h>
 #include <Preferences.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include <string.h>
 #include <algorithm>
 
@@ -20,6 +23,18 @@ extern "C" {
 
 #include "tdeck_keymap.h"
 #include "radio_sx1262.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+
+extern "C" void cybiko_radio_log(const char *fmt, ...) {
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    Serial.print(buf);
+}
 
 #if CONFIG_IDF_TARGET_ESP32S3
 #include "soc/usb_serial_jtag_struct.h"
@@ -142,10 +157,18 @@ static void render_frame_body(const uint8_t *pixels, int w, int h) {
 // Keyboard - ASCII to Cybiko matrix conversion
 // ---------------------------------------------------------------------------
 
-// Synthetic key release tracking
-#define MAX_ACTIVE_KEYS 8
-#define KEY_HOLD_FRAMES 4     // ~67ms at 60fps; CyOS sees this many run_frames
+// Synthetic key release tracking. CyOS 1.2.46 misses a key held under
+// 10 frames now and then (tools/v1_chat.c: 8 frames dropped about one key
+// in four, 10 and up dropped none). Typed keys are taps, one at a time:
+// a second tap of the same key during the first would only lengthen it,
+// so "ll" came out as "l". The C3 keyboard only keeps one unread byte, so
+// I2C is drained on its own task.
+#define MAX_ACTIVE_KEYS 16
+#define KEY_HOLD_FRAMES 12
+#define KEY_GAP_FRAMES  3     // all keys up between two taps
 #define KEY_HOLD_STICKY (-1)  // stays down until release_key()
+#define KB_QUEUE_LEN    32
+#define TAP_QUEUE_LEN   32
 
 static uint16_t key_matrix[CYBIKO_KEYBOARD_COLUMNS];
 
@@ -164,6 +187,11 @@ static struct {
 } pending_fn;
 static bool fn_pending = false;
 
+// Typed keys waiting their turn, each a key plus Shift or Fn
+static tdeck_key_event_t tap_queue[TAP_QUEUE_LEN];
+static int tap_head, tap_count;
+static int tap_gap = KEY_GAP_FRAMES;   // frames since every pulsed key went up
+
 static void press_key(int col, uint16_t mask) {
     for (int i = 0; i < active_key_count; i++) {
         if (active_keys[i].col == col && active_keys[i].mask == mask) {
@@ -173,12 +201,24 @@ static void press_key(int col, uint16_t mask) {
             return;
         }
     }
-    if (active_key_count < MAX_ACTIVE_KEYS) {
-        active_keys[active_key_count].col = col;
-        active_keys[active_key_count].mask = mask;
-        active_keys[active_key_count].frames_left = KEY_HOLD_FRAMES;
-        active_key_count++;
+    if (active_key_count >= MAX_ACTIVE_KEYS) {
+        /* A burst used to OR the 9th key into the matrix with no release
+         * slot, so it stuck until reboot. Drop the oldest pulsed key. */
+        int victim = 0;
+        for (int i = 0; i < active_key_count; i++) {
+            if (active_keys[i].frames_left != KEY_HOLD_STICKY) {
+                victim = i;
+                break;
+            }
+        }
+        key_matrix[active_keys[victim].col] &= ~active_keys[victim].mask;
+        active_keys[victim] = active_keys[active_key_count - 1];
+        active_key_count--;
     }
+    active_keys[active_key_count].col = col;
+    active_keys[active_key_count].mask = mask;
+    active_keys[active_key_count].frames_left = KEY_HOLD_FRAMES;
+    active_key_count++;
     key_matrix[col] |= mask;
 }
 
@@ -210,6 +250,39 @@ static void release_key(int col, uint16_t mask) {
     }
 }
 
+static bool pulsed_key_down(void) {
+    for (int i = 0; i < active_key_count; i++)
+        if (active_keys[i].frames_left != KEY_HOLD_STICKY)
+            return true;
+    return fn_pending;
+}
+
+static void press_tap(const tdeck_key_event_t *ev) {
+    if (ev->needs_fn) {
+        press_key(ev->col, ev->mask);
+        pending_fn.letter_col = ev->fn_col;
+        pending_fn.letter_mask = ev->fn_mask;
+        pending_fn.delay_frames = 3;
+        fn_pending = true;
+    } else {
+        if (ev->needs_shift)
+            press_key(TDECK_SHIFT_COL, TDECK_SHIFT_MASK);
+        press_key(ev->col, ev->mask);
+    }
+    tap_gap = 0;
+}
+
+static void queue_tap(const tdeck_key_event_t *ev) {
+    if (tap_count == 0 && !pulsed_key_down() && tap_gap >= KEY_GAP_FRAMES) {
+        press_tap(ev);
+        return;
+    }
+    if (tap_count == TAP_QUEUE_LEN)
+        return;   // typing far ahead of the guest; drop the newest
+    tap_queue[(tap_head + tap_count) % TAP_QUEUE_LEN] = *ev;
+    tap_count++;
+}
+
 static void keyboard_tick_frame(void) {
     for (int i = 0; i < active_key_count; ) {
         if (active_keys[i].frames_left == KEY_HOLD_STICKY) {
@@ -232,23 +305,23 @@ static void keyboard_tick_frame(void) {
             fn_pending = false;
         }
     }
+    if (pulsed_key_down()) {
+        tap_gap = 0;
+        return;
+    }
+    if (tap_gap < KEY_GAP_FRAMES)
+        tap_gap++;
+    if (tap_gap >= KEY_GAP_FRAMES && tap_count > 0) {
+        press_tap(&tap_queue[tap_head]);
+        tap_head = (tap_head + 1) % TAP_QUEUE_LEN;
+        tap_count--;
+    }
 }
 
 static void process_ascii_key(char c) {
     tdeck_key_event_t ev;
     if (!tdeck_map_ascii(c, &ev)) return;
-
-    if (ev.needs_fn) {
-        press_key(ev.col, ev.mask);
-        pending_fn.letter_col = ev.fn_col;
-        pending_fn.letter_mask = ev.fn_mask;
-        pending_fn.delay_frames = 3;
-        fn_pending = true;
-    } else {
-        if (ev.needs_shift)
-            press_key(TDECK_SHIFT_COL, TDECK_SHIFT_MASK);
-        press_key(ev.col, ev.mask);
-    }
+    queue_tap(&ev);
 }
 
 // Trackball pulse counting via interrupts.
@@ -296,9 +369,9 @@ extern "C" uint32_t cybiko_split[3];
 static void volume_step(void);
 
 static void press_special(tdeck_special_key_t k) {
-    int col; uint16_t mask;
-    if (tdeck_map_special(k, &col, &mask))
-        press_key(col, mask);
+    tdeck_key_event_t ev = {};
+    if (tdeck_map_special(k, &ev.col, &ev.mask))
+        queue_tap(&ev);
 }
 
 // The T-Deck has no Esc, F1-F7, Help, Select, Insert or Delete. $ is a
@@ -364,27 +437,57 @@ static void handle_key(char c) {
     }
 }
 
-static void poll_input(void) {
-    {
+static QueueHandle_t kb_queue;
+
+static int keyboard_drain_i2c(void) {
+    int got = 0;
+    for (int i = 0; i < 8; i++) {
         int n = Wire.requestFrom(KB_I2C_ADDR, (int)1);
-        while (n > 0 && Wire.available() > 0) {
-            uint8_t c = (uint8_t)Wire.read();
-            n--;
-            if (c != 0x00 && c != 0xFF) {
-                static int kb_log = 0;
+        if (n <= 0 || Wire.available() <= 0)
+            break;
+        uint8_t c = (uint8_t)Wire.read();
+        if (c == 0x00 || c == 0xFF)
+            break;
+        if (kb_queue)
+            xQueueSend(kb_queue, &c, 0);
+        else
+            handle_key((char)c);
+        got++;
+    }
+    return got;
+}
+
+/* The C3 keyboard holds one unread byte. Polling it only once per emulator
+ * frame dropped keys whenever radio or a DMA blit stretched a frame past
+ * the next press. This task keeps the I2C FIFO empty. */
+static void keyboard_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        int got;
+        do {
+            got = keyboard_drain_i2c();
+        } while (got >= 8);
+        bool pending = digitalRead(PIN_KB_INT) == LOW;
+        vTaskDelay(pdMS_TO_TICKS(pending ? 2 : 5));
+    }
+}
+
+static void poll_input(void) {
+    if (!kb_queue)
+        keyboard_drain_i2c();
+    uint8_t queued;
+    while (kb_queue && xQueueReceive(kb_queue, &queued, 0) == pdTRUE) {
+        static int kb_log = 0;
 #ifdef CYBIKO_KEYLOG
-                // Every byte the keyboard sends, for mapping spare keys
-                Serial.printf("KEY 0x%02X %3u '%c'\n", (unsigned char)c, (unsigned char)c,
-                              c >= 0x20 && c < 0x7F ? c : '.');
+        Serial.printf("KEY 0x%02X %3u '%c'\n", queued, queued,
+                      queued >= 0x20 && queued < 0x7F ? queued : '.');
 #else
-                if (kb_log < 16) {
-                    Serial.printf("kb %02X\n", (unsigned char)c);
-                    kb_log++;
-                }
-#endif
-                handle_key(c);
-            }
+        if (kb_log < 16) {
+            Serial.printf("kb %02X\n", queued);
+            kb_log++;
         }
+#endif
+        handle_key((char)queued);
     }
 
     // Keys from the USB serial port, for scripted tests: ASCII as from the
@@ -615,6 +718,7 @@ static void hal_audio_output(void *ctx, const uint8_t *samples, int count) {
 
 static void hal_serial_output(void *ctx, uint8_t byte) {
     (void)ctx;
+    /* USB console only. The T-Deck radio is the SX1262 on SPI, not this. */
     Serial.write(byte);
 }
 
@@ -974,21 +1078,17 @@ static int lipo_pct(int mv) {
 static void tdeck_battery_apply(bool force_ram) {
 #ifdef CYBIKO_MACHINE_V1
     if (!emu) return;
-    uint16_t ch1, ch2;
-    if (bat_usb) {
-        ch1 = 0x0300;
-        ch2 = 0x0100;
-        v1_set_lowbat_icon(false);
-    } else {
-        /* 36–39: CyOS still idles. 36 draws a shorter bar if the icon is on. */
-        int level = bat_low ? 36 : 38;
-        ch1 = ch2 = (uint16_t)(341 + level);
-        v1_set_lowbat_icon(bat_low);
-    }
+    /* CyOS 1.2.46 stops idling — and Chat stops sending — on real pack
+     * ADC (PLAN-V1). Keep Java's charger readings in the guest so an
+     * unplugged T-Deck still talks LoRa. The chrome bar uses the LiPo. */
+    uint16_t ch1 = 0x0300, ch2 = 0x0100;
     cybiko_set_adc(emu, 1, ch1);
     cybiko_set_adc(emu, 2, ch2);
+    v1_set_lowbat_icon(false);
     if (force_ram)
         v1_sync_battery_ram(ch1, ch2);
+#else
+    (void)force_ram;
 #endif
 }
 
@@ -1069,6 +1169,12 @@ void setup() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     delay(500);
     Wire.setTimeOut(50);
+    pinMode(PIN_KB_INT, INPUT_PULLUP);
+    kb_queue = xQueueCreate(KB_QUEUE_LEN, sizeof(uint8_t));
+    if (kb_queue)
+        xTaskCreatePinnedToCore(keyboard_task, "kb", 3072, NULL, 2, NULL, 1);
+    else
+        Serial.println("keyboard queue failed; polling from the emu loop");
 
     // Init TFT
     tft.init();
@@ -1406,6 +1512,12 @@ void loop() {
 
     uint32_t t0 = micros();
     audio_wait_us = 0;
+    /* Radio before the guest so a slow Reed-Solomon poll frame cannot
+     * sit on an SX1262 packet for a whole timeslice. If DIO1 is high the
+     * chip has a packet; wait out display DMA so we actually read it. */
+    if (digitalRead(PIN_RADIO_DIO1) == HIGH && tft.dmaBusy())
+        tft.dmaWait();
+    cybiko_sx1262_pump();
     cybiko_run_frame(emu);
     // Time blocked on the audio queue is pacing, not emulation
     frame_us += micros() - t0 - audio_wait_us;
@@ -1413,6 +1525,8 @@ void loop() {
     keyboard_tick_frame();
     count_i2s_underruns();
 
+    if (digitalRead(PIN_RADIO_DIO1) == HIGH && tft.dmaBusy())
+        tft.dmaWait();
     cybiko_sx1262_pump();
     {
         bool sof = usb_host_via_sof();
@@ -1484,10 +1598,9 @@ void loop() {
             cybiko_get_spi_flash(emu, NULL, &fw);
             cybiko_v1_radio_status_t rs;
             if (cybiko_v1_radio_status(emu, &rs))
-                Serial.printf("  flash pages written %lu  classic radio: rf %s boot %s "
+                Serial.printf("  flash pages written %lu  classic radio: %s "
                               "sent %lu delivered %lu\n", (unsigned long)fw,
-                              rs.rf_resolved ? "up" : (rs.rf_armed ? "armed" : "-"),
-                              rs.bootstrapped ? "yes" : "no",
+                              rs.radio_up ? "up" : "-",
                               (unsigned long)rs.tx_frames, (unsigned long)rs.rx_injected);
             else
                 Serial.printf("  flash pages written %lu\n", (unsigned long)fw);
@@ -1495,14 +1608,13 @@ void loop() {
 #endif
         if (const cybiko_lora_t *lk = cybiko_sx1262_link()) {
             const cybiko_sx1262_stats_t *rs = cybiko_sx1262_phy_stats();
-            Serial.printf("  radio rx %lu (crc %lu, link bad %lu, msgs %lu held %lu) "
-                          "tx %lu done %lu rejected %lu held %lu  rssi %d snr %d  bus waits %lu\n",
+            Serial.printf("  radio rx %lu (crc %lu, link bad %lu, msgs %lu) "
+                          "tx %lu done %lu rejected %lu waited %lu  rssi %d snr %d  bus waits %lu\n",
                           (unsigned long)rs->rx_ok, (unsigned long)rs->rx_crc,
                           (unsigned long)lk->stats.rx_bad, (unsigned long)lk->stats.rx_msgs,
-                          (unsigned long)lk->stats.rx_held,
                           (unsigned long)lk->stats.tx_pkts, (unsigned long)rs->tx_done,
                           (unsigned long)lk->stats.tx_rejected,
-                          (unsigned long)lk->stats.tx_held,
+                          (unsigned long)rs->tx_deferred,
                           rs->last_rssi_dbm, rs->last_snr_db,
                           (unsigned long)rs->bus_waits);
         }

@@ -49,7 +49,8 @@
 #include "radio_serial_phy.h"
 
 #define MAX_HELD 16
-#define MIN_HOLD 3
+/* CyOS 1.2.46 misses a key held under 10 frames now and then (v1_chat) */
+#define MIN_HOLD 12
 
 /* img/cybiko.png (887x1774). Interior screen hole is ~189,638 509x308;
  * pad a few pixels under the bezel so scale rounding never leaves a rim. */
@@ -58,11 +59,18 @@
 #define SHELL_SCREEN_W 515
 #define SHELL_SCREEN_H 314
 
-#define MENU_N 3
+#define MENU_N 5
 #define MENU_W 168
 #define MENU_ROW 28
 #define SETTINGS_W 420
 #define SETTINGS_H 430
+#define ABOUT_W 440
+#define ABOUT_H 490
+#define STATUS_W 440
+#define STATUS_H 380
+#define OVERLAY_SETTINGS 1
+#define OVERLAY_ABOUT 2
+#define OVERLAY_STATUS 3
 
 #define FLASH_IDLE 0
 #define FLASH_BUSY 1
@@ -103,6 +111,16 @@ typedef struct {
     bool settings_open;
     SDL_Window *settings_win;
     SDL_Renderer *settings_ren;
+    bool about_open;
+    SDL_Window *about_win;
+    SDL_Renderer *about_ren;
+    bool status_open;
+    SDL_Window *status_win;
+    SDL_Renderer *status_ren;
+    int overlay_front;
+    cybiko_emu_t *emu;
+    cybiko_lora_t *lora;
+    uint32_t radio_cyid;
     bool always_on_top;
     bool mute;
     int scale_pct;
@@ -452,7 +470,9 @@ static void draw_text(SDL_Renderer *ren, int x, int y, int scale,
     }
 }
 
-static const char *MENU_LABEL[MENU_N] = { "Settings", "Minimize", "Close" };
+static const char *MENU_LABEL[MENU_N] = {
+    "Settings", "Status", "Help", "Minimize", "Close"
+};
 
 static void menu_rect(const sdl_ctx_t *s, SDL_Rect *out) {
     out->x = s->menu_x;
@@ -921,12 +941,12 @@ static unsigned long pick_argb_visual(void) {
 }
 #endif
 
-/* Keep Settings above the Cybiko without stealing keyboard/mouse focus. */
-static void restack_settings(sdl_ctx_t *s) {
+/* Keep overlay windows above the Cybiko without stealing focus. */
+static void raise_overlay(SDL_Window *win) {
     SDL_SysWMinfo info;
-    if (!s->settings_win) return;
+    if (!win) return;
     SDL_VERSION(&info.version);
-    if (!SDL_GetWindowWMInfo(s->settings_win, &info)) return;
+    if (!SDL_GetWindowWMInfo(win, &info)) return;
 #ifdef _WIN32
     if (info.subsystem == SDL_SYSWM_WINDOWS) {
         SetWindowPos(info.info.win.window, HWND_TOP, 0, 0, 0, 0,
@@ -940,13 +960,35 @@ static void restack_settings(sdl_ctx_t *s) {
 #endif
 }
 
+static void restack_overlays(sdl_ctx_t *s) {
+    raise_overlay(s->settings_win);
+    raise_overlay(s->about_win);
+    raise_overlay(s->status_win);
+    if (s->overlay_front == OVERLAY_SETTINGS)
+        raise_overlay(s->settings_win);
+    else if (s->overlay_front == OVERLAY_ABOUT)
+        raise_overlay(s->about_win);
+    else if (s->overlay_front == OVERLAY_STATUS)
+        raise_overlay(s->status_win);
+}
+
 static void apply_always_on_top(sdl_ctx_t *s) {
     if (s->win)
         SDL_SetWindowAlwaysOnTop(s->win, s->always_on_top);
-    if (s->settings_win) {
+    if (s->settings_win)
         SDL_SetWindowAlwaysOnTop(s->settings_win, s->always_on_top);
-        restack_settings(s);
-    }
+    if (s->about_win)
+        SDL_SetWindowAlwaysOnTop(s->about_win, s->always_on_top);
+    if (s->status_win)
+        SDL_SetWindowAlwaysOnTop(s->status_win, s->always_on_top);
+    restack_overlays(s);
+}
+
+static int overlay_next(const sdl_ctx_t *s) {
+    if (s->status_open) return OVERLAY_STATUS;
+    if (s->about_open) return OVERLAY_ABOUT;
+    if (s->settings_open) return OVERLAY_SETTINGS;
+    return 0;
 }
 
 static void close_settings(sdl_ctx_t *s) {
@@ -959,6 +1001,36 @@ static void close_settings(sdl_ctx_t *s) {
         s->settings_win = NULL;
     }
     s->settings_open = false;
+    if (s->overlay_front == OVERLAY_SETTINGS)
+        s->overlay_front = overlay_next(s);
+}
+
+static void close_about(sdl_ctx_t *s) {
+    if (s->about_ren) {
+        SDL_DestroyRenderer(s->about_ren);
+        s->about_ren = NULL;
+    }
+    if (s->about_win) {
+        SDL_DestroyWindow(s->about_win);
+        s->about_win = NULL;
+    }
+    s->about_open = false;
+    if (s->overlay_front == OVERLAY_ABOUT)
+        s->overlay_front = overlay_next(s);
+}
+
+static void close_status(sdl_ctx_t *s) {
+    if (s->status_ren) {
+        SDL_DestroyRenderer(s->status_ren);
+        s->status_ren = NULL;
+    }
+    if (s->status_win) {
+        SDL_DestroyWindow(s->status_win);
+        s->status_win = NULL;
+    }
+    s->status_open = false;
+    if (s->overlay_front == OVERLAY_STATUS)
+        s->overlay_front = overlay_next(s);
 }
 
 static void shell_accent(int color, uint8_t *r, uint8_t *g, uint8_t *b) {
@@ -1121,7 +1193,8 @@ static void open_settings(sdl_ctx_t *s) {
     Uint32 flags = 0;
     s->menu_open = false;
     if (s->settings_open) {
-        restack_settings(s);
+        s->overlay_front = OVERLAY_SETTINGS;
+        restack_overlays(s);
         return;
     }
     if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
@@ -1137,8 +1210,9 @@ static void open_settings(sdl_ctx_t *s) {
     if (s->win)
         SDL_SetWindowModalFor(s->settings_win, s->win);
     apply_app_icon(s, s->settings_win);
-    apply_always_on_top(s);
     s->settings_open = true;
+    s->overlay_front = OVERLAY_SETTINGS;
+    apply_always_on_top(s);
     refresh_devices(s);
     draw_settings(s);
 }
@@ -1192,11 +1266,215 @@ static void settings_click(sdl_ctx_t *s, int x, int y) {
     draw_settings(s);
 }
 
+typedef struct { const char *t; uint8_t sec; } about_line_t;
+
+static const about_line_t ABOUT[] = {
+    { "The original pocket computer.", 0 },
+    { "Still on the air.", 0 },
+    { "", 0 },
+    { "This is not a tribute app. It", 0 },
+    { "boots the real CyOS. A Heltec", 0 },
+    { "V3 is the PC radio. A LilyGO", 0 },
+    { "T-Deck is a handheld Cybiko.", 0 },
+    { "", 0 },
+    { "Get going", 1 },
+    { " Plug in a Heltec. The app", 0 },
+    { " finds it. First boot asks", 0 },
+    { " for a nickname, then you", 0 },
+    { " land on the CyOS desktop.", 0 },
+    { " Chat and Nearby see other", 0 },
+    { " Cybikos on 915 MHz.", 0 },
+    { " Right-click for Settings.", 0 },
+    { "", 0 },
+    { "PC", 1 },
+    { " Keyboard types. Click the", 0 },
+    { " photo keys. Arrows move.", 0 },
+    { " Enter opens. Esc backs out.", 0 },
+    { " Ctrl+Q quits. Drag the body", 0 },
+    { " to move the window.", 0 },
+    { "", 0 },
+    { "T-Deck", 1 },
+    { " The keyboard is the Cybiko.", 0 },
+    { " Trackball moves. Click under", 0 },
+    { " 0.6s is Enter. Hold 0.6s+", 0 },
+    { " is Esc.", 0 },
+    { " $ then a letter:", 0 },
+    { "  $x Esc    $h Help", 0 },
+    { "  $s Select $i Ins  $d Del", 0 },
+    { "  $g Tab    $q-$u F1-F7", 0 },
+    { "  $$ types a dollar sign", 0 },
+    { "  $v or Shift+$ volume", 0 },
+};
+
+static void draw_about(sdl_ctx_t *s) {
+    uint8_t ar, ag, ab;
+    char ver[40];
+    if (!s->about_ren) return;
+    shell_accent(s->color, &ar, &ag, &ab);
+    SDL_SetRenderDrawColor(s->about_ren, 16, 20, 28, 255);
+    SDL_RenderClear(s->about_ren);
+    draw_text(s->about_ren, 20, 16, 2, ar, ag, ab, "Cybiko");
+    snprintf(ver, sizeof ver, "v%s  original CyOS", CYBIKO_EMU_VERSION);
+    draw_text(s->about_ren, 20, 40, 1, 180, 190, 210, ver);
+    for (size_t i = 0; i < sizeof ABOUT / sizeof ABOUT[0]; i++) {
+        int y = 60 + (int)i * 11;
+        if (ABOUT[i].sec)
+            draw_text(s->about_ren, 20, y, 1, ar, ag, ab, ABOUT[i].t);
+        else if (ABOUT[i].t[0])
+            draw_text(s->about_ren, 20, y, 1, 230, 240, 255, ABOUT[i].t);
+    }
+    draw_text(s->about_ren, 20, ABOUT_H - 36, 2, ar, ag, ab, "[ Done ]");
+    SDL_RenderPresent(s->about_ren);
+}
+
+static void open_about(sdl_ctx_t *s) {
+    Uint32 flags = 0;
+    s->menu_open = false;
+    if (s->about_open) {
+        s->overlay_front = OVERLAY_ABOUT;
+        restack_overlays(s);
+        return;
+    }
+    if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    s->about_win = SDL_CreateWindow("Cybiko Help",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        ABOUT_W, ABOUT_H, flags);
+    s->about_ren = s->about_win
+        ? SDL_CreateRenderer(s->about_win, -1, SDL_RENDERER_ACCELERATED) : NULL;
+    if (!s->about_ren) {
+        close_about(s);
+        return;
+    }
+    if (s->win)
+        SDL_SetWindowModalFor(s->about_win, s->win);
+    apply_app_icon(s, s->about_win);
+    s->about_open = true;
+    s->overlay_front = OVERLAY_ABOUT;
+    apply_always_on_top(s);
+    draw_about(s);
+}
+
+static void about_click(sdl_ctx_t *s, int x, int y) {
+    (void)x;
+    if (y >= ABOUT_H - 44) {
+        close_about(s);
+        return;
+    }
+}
+
+static void draw_status(sdl_ctx_t *s) {
+    uint8_t ar, ag, ab;
+    char line[56];
+    cybiko_v1_radio_status_t st = {0};
+    const char *port;
+    int heltec_yes;
+    SDL_Renderer *ren;
+    if (!s->status_ren) return;
+    ren = s->status_ren;
+    refresh_devices(s);
+    heltec_yes = s->heltec_port[0] != 0;
+    port = heltec_yes ? short_port(s->heltec_port) : "not found";
+    if (s->emu)
+        cybiko_v1_radio_status(s->emu, &st);
+    shell_accent(s->color, &ar, &ag, &ab);
+    SDL_SetRenderDrawColor(ren, 16, 20, 28, 255);
+    SDL_RenderClear(ren);
+    draw_text(ren, 20, 16, 2, ar, ag, ab, "Status");
+
+    draw_text(ren, 20, 52, 2, ar, ag, ab, "Heltec");
+    snprintf(line, sizeof line, "  %s  %s", heltec_yes ? "YES" : "NO", port);
+    draw_text(ren, 20, 76, 1, heltec_yes ? 90 : 255, heltec_yes ? 220 : 90,
+              heltec_yes ? 130 : 90, line);
+    if (s->radio_on)
+        draw_text(ren, 20, 92, 1, 90, 220, 130, "  CyRadio linked");
+    else if (heltec_yes)
+        draw_text(ren, 20, 92, 1, 255, 180, 80, "  seen, radio not open");
+    else
+        draw_text(ren, 20, 92, 1, 255, 90, 90, "  plug in a Heltec V3");
+    if (s->phy && s->phy->hello[0]) {
+        snprintf(line, sizeof line, "  hello %.36s", s->phy->hello);
+        draw_text(ren, 20, 108, 1, 180, 190, 210, line);
+    } else {
+        draw_text(ren, 20, 108, 1, 180, 190, 210, "  no modem hello yet");
+    }
+    if (s->phy && s->radio_on) {
+        snprintf(line, sizeof line, "  rssi %d dBm  snr %d",
+                 s->phy->stats.last_rssi_dbm, s->phy->stats.last_snr_db);
+        draw_text(ren, 20, 124, 1, 230, 240, 255, line);
+        snprintf(line, sizeof line, "  usb rx %u  tx ok %u  lost %u",
+                 s->phy->stats.rx_pkts, s->phy->stats.tx_sent,
+                 s->phy->stats.tx_lost);
+        draw_text(ren, 20, 140, 1, 230, 240, 255, line);
+    }
+    if (s->lora) {
+        snprintf(line, sizeof line, "  air tx %u  rx %u  bad %u",
+                 s->lora->stats.tx_pkts, s->lora->stats.rx_msgs,
+                 s->lora->stats.rx_bad);
+        draw_text(ren, 20, 156, 1, 230, 240, 255, line);
+    }
+
+    draw_text(ren, 20, 184, 2, ar, ag, ab, "T-Deck");
+    if (s->tdeck_port[0]) {
+        snprintf(line, sizeof line, "  YES  %s", short_port(s->tdeck_port));
+        draw_text(ren, 20, 208, 1, 90, 220, 130, line);
+    } else {
+        draw_text(ren, 20, 208, 1, 180, 190, 210, "  not on USB");
+    }
+
+    draw_text(ren, 20, 236, 2, ar, ag, ab, "CyOS radio");
+    snprintf(line, sizeof line, "  radio %s  CyID %08X",
+             st.radio_up ? "up" : "-",
+             (unsigned)s->radio_cyid);
+    draw_text(ren, 20, 260, 1, 230, 240, 255, line);
+    snprintf(line, sizeof line, "  guest sent %u  delivered %u",
+             st.tx_frames, st.rx_injected);
+    draw_text(ren, 20, 276, 1, 230, 240, 255, line);
+
+    draw_text(ren, 20, STATUS_H - 36, 2, ar, ag, ab, "[ Done ]");
+    SDL_RenderPresent(ren);
+}
+
+static void open_status(sdl_ctx_t *s) {
+    Uint32 flags = 0;
+    s->menu_open = false;
+    if (s->status_open) {
+        s->overlay_front = OVERLAY_STATUS;
+        restack_overlays(s);
+        draw_status(s);
+        return;
+    }
+    if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    s->status_win = SDL_CreateWindow("Cybiko Status",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        STATUS_W, STATUS_H, flags);
+    s->status_ren = s->status_win
+        ? SDL_CreateRenderer(s->status_win, -1, SDL_RENDERER_ACCELERATED) : NULL;
+    if (!s->status_ren) {
+        close_status(s);
+        return;
+    }
+    if (s->win)
+        SDL_SetWindowModalFor(s->status_win, s->win);
+    apply_app_icon(s, s->status_win);
+    s->status_open = true;
+    s->overlay_front = OVERLAY_STATUS;
+    apply_always_on_top(s);
+    draw_status(s);
+}
+
+static void status_click(sdl_ctx_t *s, int x, int y) {
+    (void)x;
+    if (y >= STATUS_H - 44)
+        close_status(s);
+}
+
 static void menu_action(sdl_ctx_t *s, int item) {
     s->menu_open = false;
     if (item == 0) open_settings(s);
-    else if (item == 1 && s->win) SDL_MinimizeWindow(s->win);
-    else if (item == 2 && s->running) *s->running = false;
+    else if (item == 1) open_status(s);
+    else if (item == 2) open_about(s);
+    else if (item == 3 && s->win) SDL_MinimizeWindow(s->win);
+    else if (item == 4 && s->running) *s->running = false;
 }
 
 static const shell_hit_t *hit_at(int x, int y) {
@@ -1363,6 +1641,8 @@ static void on_key(sdl_ctx_t *s, const SDL_KeyboardEvent *ev) {
 static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
     int ix, iy;
     Uint32 settings_id = s->settings_win ? SDL_GetWindowID(s->settings_win) : 0;
+    Uint32 about_id = s->about_win ? SDL_GetWindowID(s->about_win) : 0;
+    Uint32 status_id = s->status_win ? SDL_GetWindowID(s->status_win) : 0;
     switch (ev->type) {
     case SDL_QUIT:
         *running = false;
@@ -1376,10 +1656,23 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
             s->menu_open = false;
             break;
         }
+        if (s->about_open && about_id && ev->key.windowID == about_id
+            && ev->key.keysym.sym == SDLK_ESCAPE) {
+            close_about(s);
+            break;
+        }
+        if (s->status_open && status_id && ev->key.windowID == status_id
+            && ev->key.keysym.sym == SDLK_ESCAPE) {
+            close_status(s);
+            break;
+        }
         /* fall through */
     case SDL_KEYUP:
-        if (!s->settings_open || ev->key.windowID != settings_id)
-            on_key(s, &ev->key);
+        if ((settings_id && ev->key.windowID == settings_id)
+            || (about_id && ev->key.windowID == about_id)
+            || (status_id && ev->key.windowID == status_id))
+            break;
+        on_key(s, &ev->key);
         break;
     case SDL_MOUSEBUTTONDOWN:
         if (settings_id && ev->button.windowID == settings_id) {
@@ -1387,8 +1680,18 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
                 settings_click(s, ev->button.x, ev->button.y);
             break;
         }
-        if (s->settings_open)
-            restack_settings(s);
+        if (about_id && ev->button.windowID == about_id) {
+            if (ev->button.button == SDL_BUTTON_LEFT)
+                about_click(s, ev->button.x, ev->button.y);
+            break;
+        }
+        if (status_id && ev->button.windowID == status_id) {
+            if (ev->button.button == SDL_BUTTON_LEFT)
+                status_click(s, ev->button.x, ev->button.y);
+            break;
+        }
+        if (s->settings_open || s->about_open || s->status_open)
+            restack_overlays(s);
         if (ev->button.button == SDL_BUTTON_RIGHT) {
             s->menu_open = true;
             s->menu_x = ev->button.x;
@@ -1439,7 +1742,9 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
         mouse_release(s);
         break;
     case SDL_MOUSEMOTION:
-        if (s->menu_open && (!settings_id || ev->motion.windowID != settings_id))
+        if (s->menu_open && ev->motion.windowID != settings_id
+            && ev->motion.windowID != about_id
+            && ev->motion.windowID != status_id)
             s->menu_hover = menu_item_at(s, ev->motion.x, ev->motion.y);
         if (s->dragging && (ev->motion.state & SDL_BUTTON_LMASK) && s->win) {
             int gx, gy;
@@ -1449,7 +1754,9 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
         }
         if (!(ev->motion.state & SDL_BUTTON_LMASK) || !s->shell || s->menu_open
             || s->view == VIEW_CLOSEUP) break;
-        if (settings_id && ev->motion.windowID == settings_id) break;
+        if ((settings_id && ev->motion.windowID == settings_id)
+            || (about_id && ev->motion.windowID == about_id)
+            || (status_id && ev->motion.windowID == status_id)) break;
         win_to_img(s, ev->motion.x, ev->motion.y, &ix, &iy);
         mouse_to(s, ix, iy, true);
         break;
@@ -1459,6 +1766,20 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
                 close_settings(s);
             else if (ev->window.event == SDL_WINDOWEVENT_EXPOSED)
                 draw_settings(s);
+            break;
+        }
+        if (about_id && ev->window.windowID == about_id) {
+            if (ev->window.event == SDL_WINDOWEVENT_CLOSE)
+                close_about(s);
+            else if (ev->window.event == SDL_WINDOWEVENT_EXPOSED)
+                draw_about(s);
+            break;
+        }
+        if (status_id && ev->window.windowID == status_id) {
+            if (ev->window.event == SDL_WINDOWEVENT_CLOSE)
+                close_status(s);
+            else if (ev->window.event == SDL_WINDOWEVENT_EXPOSED)
+                draw_status(s);
             break;
         }
         if (ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
@@ -1474,8 +1795,8 @@ static void on_event(sdl_ctx_t *s, const SDL_Event *ev, bool *running) {
             }
             apply_window_shape(s);
         } else if (ev->window.event == SDL_WINDOWEVENT_FOCUS_GAINED
-                   && s->settings_open) {
-            restack_settings(s);
+                   && (s->settings_open || s->about_open || s->status_open)) {
+            restack_overlays(s);
         }
         break;
     default:
@@ -1536,15 +1857,14 @@ static void radio_report(const cybiko_emu_t *emu, const cybiko_lora_t *lt,
                          const cybiko_serial_phy_t *sp) {
     cybiko_v1_radio_status_t st = {0};
     cybiko_v1_radio_status(emu, &st);
-    fprintf(stderr, "Radio: rf %s%s boot %s guest sent %u delivered %u  "
-            "tx msgs %u pkts %u held %u rejected %u  rx pkts %u msgs %u held %u bad %u  "
+    fprintf(stderr, "Radio: %s guest sent %u delivered %u  "
+            "tx msgs %u pkts %u rejected %u  rx pkts %u msgs %u bad %u  "
             "rssi %d snr %d\n",
-            st.rf_armed ? "armed" : "-", st.rf_resolved ? "+up" : "",
-            st.bootstrapped ? "yes" : "no",
+            st.radio_up ? "up" : "-",
             st.tx_frames, st.rx_injected,
-            lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_held,
+            lt->stats.tx_msgs, lt->stats.tx_pkts,
             lt->stats.tx_rejected, lt->stats.rx_pkts, lt->stats.rx_msgs,
-            lt->stats.rx_held, lt->stats.rx_bad,
+            lt->stats.rx_bad,
             sp->stats.last_rssi_dbm, sp->stats.last_snr_db);
 }
 
@@ -1736,6 +2056,8 @@ int main(int argc, char **argv) {
     static cybiko_lora_t link;
     static cybiko_radio_coproc_t cop;
     sdl.phy = &phy;
+    sdl.emu = emu;
+    sdl.radio_cyid = cyid;
     if (!radio_path) {
         refresh_devices(&sdl);
         if (sdl.heltec_port[0]) {
@@ -1752,11 +2074,15 @@ int main(int argc, char **argv) {
     sdl.radio_path = radio_path;
     if (radio_path) {
         if (cybiko_serial_phy_open(&phy, radio_path) != 0) {
-            fprintf(stderr, "radio '%s': %s, continuing without radio\n",
-                    radio_path, strerror(errno));
+            fprintf(stderr, "radio '%s': %s%s\n", radio_path, strerror(errno),
+                    errno == EBUSY
+                        ? " — this window will not use CyRadio"
+                        : ", continuing without radio");
         } else {
             phy.on_text = radio_on_text;
             cybiko_lora_init(&link, &phy.phy, cyid, true);
+            cybiko_lora_seed_msg_id(&link, (uint32_t)SDL_GetPerformanceCounter());
+            sdl.lora = &link;
             cybiko_radio_coproc_init(&cop);
             cybiko_radio_coproc_set_transport(&cop, &link.base);
             cybiko_attach_radio_id(emu, &cop, cyid);
@@ -1771,6 +2097,7 @@ int main(int argc, char **argv) {
     bool running = true;
     sdl.running = &running;
     uint32_t radio_at = SDL_GetTicks() + 10000;
+    uint32_t status_at = 0;
     while (running) {
         uint32_t t0 = SDL_GetTicks();
         SDL_Event ev;
@@ -1792,6 +2119,10 @@ int main(int argc, char **argv) {
                 refresh_devices(&sdl);
             sdl.flash_shown = sdl.flash_state;
             draw_settings(&sdl);
+        }
+        if (sdl.status_open && (int32_t)(t0 - status_at) >= 250) {
+            status_at = t0;
+            draw_status(&sdl);
         }
         while (SDL_PollEvent(&ev))
             on_event(&sdl, &ev, &running);
@@ -1822,6 +2153,8 @@ int main(int argc, char **argv) {
         cybiko_serial_phy_close(&phy);
     }
     cybiko_destroy(emu);
+    close_status(&sdl);
+    close_about(&sdl);
     close_settings(&sdl);
     if (audio) SDL_CloseAudioDevice(audio);
     if (sdl.shell) SDL_DestroyTexture(sdl.shell);

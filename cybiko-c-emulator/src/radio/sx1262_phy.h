@@ -52,6 +52,7 @@ typedef struct {
     uint32_t rx_crc;         /* LoRa CRC or header error: dropped */
     uint32_t rx_overflow;    /* inbox full: dropped */
     uint32_t bus_waits;      /* poll/tx skipped because the bus was busy */
+    uint32_t tx_deferred;    /* another radio was on the air: waited */
     int16_t  last_rssi_dbm;
     int8_t   last_snr_db;
     uint8_t  status;         /* last GetStatus byte */

@@ -1980,7 +1980,7 @@ static bool H8S_HOT hle_v1_rs(h8s_cpu_t *cpu) {
 /* Low byte of each hooked PC, so the run loop pays one table load */
 static const uint8_t v1_hle_lo[256] = {
     [V1_CRC_LOOP & 0xFF] = 1, [V1_MEMSET_LOOP & 0xFF] = 1, [V1_LCD_ROW_LOOP & 0xFF] = 1,
-    [CYBIKO_V1_SET_TASK_STATE & 0xFF] = 1, [V1_RS_START & 0xFF] = 1 };
+    [V1_RS_START & 0xFF] = 1 };
 
 static bool H8S_HOT hle_v1(h8s_cpu_t *cpu) {
     switch (cpu->pc) {
@@ -1988,9 +1988,6 @@ static bool H8S_HOT hle_v1(h8s_cpu_t *cpu) {
     case V1_MEMSET_LOOP:  return hle_v1_memset(cpu);
     case V1_LCD_ROW_LOOP: return hle_v1_lcd_row(cpu);
     case V1_RS_START:     return hle_v1_rs(cpu);
-    case CYBIKO_V1_SET_TASK_STATE:
-        cybiko_sci0_on_set_task_state(&cpu->bus->sci0);
-        return false;   /* only observes; the call runs as normal */
     }
     return false;
 }

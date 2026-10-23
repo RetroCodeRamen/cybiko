@@ -33,6 +33,7 @@ typedef struct {
     intptr_t fd;  /* POSIX fd, or Win32 HANDLE */
     int tx_busy;
     uint64_t tx_started_ms;
+    uint64_t last_status_ms;
     void *dec;   /* slip_decoder_t, kept out of this header */
     struct {
         uint8_t len;

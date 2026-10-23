@@ -41,10 +41,14 @@
 
 #define IRQ_TX_DONE    0x0001
 #define IRQ_RX_DONE    0x0002
+#define IRQ_PREAMBLE   0x0004
+#define IRQ_HEADER_OK  0x0010
 #define IRQ_HEADER_ERR 0x0020
 #define IRQ_CRC_ERR    0x0040
 #define IRQ_TIMEOUT    0x0200
 #define IRQ_USED (IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT)
+/* Latched but not on DIO1: someone else's packet is arriving */
+#define IRQ_CARRIER (IRQ_PREAMBLE | IRQ_HEADER_OK)
 
 #define REG_SYNC_WORD   0x0740
 #define REG_IQ_POLARITY 0x0736
@@ -65,6 +69,14 @@
 
 #define INBOX 4
 
+/* Listen before talk. A send waits a random 0..TX_JITTER_MS so two radios
+ * that decide together rarely start together, then waits while a packet
+ * is arriving (preamble or header seen): one longest packet plus a random
+ * part of another, then looks again. A carrier flag that never clears
+ * (a preamble with no packet) stops blocking after LBT_GIVE_UP_MS. */
+#define TX_JITTER_MS   30
+#define LBT_GIVE_UP_MS 2000
+
 static cybiko_sx1262_pins_t pins;
 static cybiko_lora_profile_t prof;
 static cybiko_sx1262_stats_t stats;
@@ -73,6 +85,10 @@ static char last_error[40] = "not started";
 static bool started;
 static bool tx_inflight;
 static uint32_t tx_started_ms;
+static uint8_t tx_buf[CYBIKO_LINK_MAX_PHYS];
+static uint8_t tx_len;
+static bool tx_waiting;            /* accepted, not on the air yet */
+static uint32_t tx_wait_since, tx_not_before;
 static uint32_t busy_ms = BUSY_INIT_MS;
 
 static struct {
@@ -232,39 +248,70 @@ void cybiko_lora_profile_default(cybiko_lora_profile_t *p) {
 
 /* ---- PHY ops ---- */
 
-static int phy_tx(cybiko_radio_phy_t *self, const uint8_t *pkt, size_t len) {
-    (void)self;
-    if (!started || tx_inflight || len == 0 || len > CYBIKO_LINK_MAX_PHYS)
-        return -1;
-    if (cybiko_lora_airtime_ms(&prof, (unsigned)len) >= TX_TIMEOUT_MS)
-        return -1;
-    if (!bus_ok()) {
-        stats.bus_waits++;
-        return -1;
-    }
+static void start_tx(void) {
     uint8_t hdr[2] = { CMD_WRITE_BUFFER, 0x00 };
     uint8_t buf[2 + CYBIKO_LINK_MAX_PHYS];
     memcpy(buf, hdr, 2);
-    memcpy(buf + 2, pkt, len);
+    memcpy(buf + 2, tx_buf, tx_len);
     static const uint8_t timeout[3] = {
         (uint8_t)(TX_TIMEOUT_TICKS >> 16), (uint8_t)(TX_TIMEOUT_TICKS >> 8),
         (uint8_t)TX_TIMEOUT_TICKS };
+    tx_waiting = false;
     if (!cmd1(CMD_SET_STANDBY, STDBY_RC) ||
-        !xfer(buf, 2 + len, NULL, 0) ||
-        !packet_params((uint8_t)len) ||
+        !xfer(buf, 2 + (size_t)tx_len, NULL, 0) ||
+        !packet_params(tx_len) ||
         !clear_irq(0xFFFF) ||
         !cmd(CMD_SET_TX, timeout, 3)) {
+        stats.tx_timeout++;   /* counted as lost; the link has no retry */
         start_rx();
-        return -1;
+        return;
     }
     tx_inflight = true;
     tx_started_ms = millis();
+}
+
+/* Start the waiting packet if its jitter is over and the air is free */
+static void try_tx(void) {
+    if (!tx_waiting || tx_inflight)
+        return;
+    uint32_t now = millis();
+    if ((int32_t)(now - tx_not_before) < 0)
+        return;
+    if (!bus_ok()) {
+        stats.bus_waits++;
+        return;
+    }
+    uint16_t irq = 0;
+    if (!get_irq(&irq))
+        return;
+    if ((irq & IRQ_CARRIER) && !(irq & IRQ_RX_DONE) &&
+        now - tx_wait_since < LBT_GIVE_UP_MS) {
+        uint32_t longest = cybiko_lora_airtime_ms(&prof, CYBIKO_LINK_MAX_PHYS);
+        clear_irq(IRQ_CARRIER);
+        tx_not_before = now + longest + (uint32_t)random((long)longest + 1);
+        stats.tx_deferred++;
+        return;
+    }
+    start_tx();
+}
+
+static int phy_tx(cybiko_radio_phy_t *self, const uint8_t *pkt, size_t len) {
+    (void)self;
+    if (!started || tx_inflight || tx_waiting || len == 0 || len > CYBIKO_LINK_MAX_PHYS)
+        return -1;
+    if (cybiko_lora_airtime_ms(&prof, (unsigned)len) >= TX_TIMEOUT_MS)
+        return -1;
+    memcpy(tx_buf, pkt, len);
+    tx_len = (uint8_t)len;
+    tx_waiting = true;
+    tx_wait_since = millis();
+    tx_not_before = tx_wait_since + (uint32_t)random(TX_JITTER_MS + 1);
     return 0;
 }
 
 static int phy_tx_busy(cybiko_radio_phy_t *self) {
     (void)self;
-    return tx_inflight;
+    return tx_inflight || tx_waiting;
 }
 
 static int phy_rx(cybiko_radio_phy_t *self, uint8_t *buf, size_t cap, size_t *len) {
@@ -312,8 +359,10 @@ static void phy_poll(cybiko_radio_phy_t *self) {
         return;
     bool irq_line = digitalRead(pins.dio1) == HIGH;
     bool overdue = tx_inflight && millis() - tx_started_ms > TX_TIMEOUT_MS + 500;
-    if (!irq_line && !overdue)
+    if (!irq_line && !overdue) {
+        try_tx();
         return;
+    }
     if (!bus_ok()) {
         stats.bus_waits++;
         return;
@@ -338,6 +387,7 @@ static void phy_poll(cybiko_radio_phy_t *self) {
         tx_inflight = false;
         start_rx();
     }
+    try_tx();
 }
 
 /* ---- setup ---- */
@@ -362,6 +412,7 @@ int cybiko_sx1262_phy_begin(const cybiko_sx1262_pins_t *p,
     stats.device_errors = 0xFFFF;
     started = false;
     tx_inflight = false;
+    tx_waiting = false;
     in_head = in_count = 0;
     busy_ms = BUSY_INIT_MS;
 
@@ -432,7 +483,8 @@ int cybiko_sx1262_phy_begin(const cybiko_sx1262_pins_t *p,
     uint8_t sync[2] = { (uint8_t)(prof.sync_word >> 8), (uint8_t)prof.sync_word };
     STEP(write_reg(REG_SYNC_WORD, sync, 2), "sync word", -8);
 
-    uint8_t dio[8] = { (uint8_t)(IRQ_USED >> 8), (uint8_t)IRQ_USED,
+    const uint16_t latched = IRQ_USED | IRQ_CARRIER;
+    uint8_t dio[8] = { (uint8_t)(latched >> 8), (uint8_t)latched,
                        (uint8_t)(IRQ_USED >> 8), (uint8_t)IRQ_USED, 0, 0, 0, 0 };
     STEP(cmd(CMD_SET_DIO_IRQ, dio, 8), "dio irq", -9);
     STEP(clear_irq(0xFFFF), "clear irq", -9);

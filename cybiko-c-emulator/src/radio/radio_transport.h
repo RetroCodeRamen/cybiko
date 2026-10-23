@@ -30,7 +30,11 @@ extern "C" {
  * that would break a local duty cycle. These are not yet programmed
  * into a chip. */
 #define CYBIKO_LORA_FREQ_HZ       915000000u
-#define CYBIKO_LORA_BW_HZ         125000u
+/* 500 kHz: a 192-byte Chat frame is ~85 ms on the air instead of ~330 ms,
+ * so CyOS's three copies of a message leave the channel free sooner. In
+ * the US, a fixed channel this wide is digital modulation under FCC
+ * 15.247 rather than the ~0 dBm 15.249 limit a 125 kHz channel has. */
+#define CYBIKO_LORA_BW_HZ         500000u
 #define CYBIKO_LORA_SF            7
 #define CYBIKO_LORA_CR_DENOM      5       /* 4/5 */
 #ifndef CYBIKO_LORA_POWER_DBM     /* bench builds pass a lower value */

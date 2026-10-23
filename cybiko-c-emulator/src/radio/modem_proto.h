@@ -12,7 +12,8 @@
  *
  * PC -> modem
  *   'T' pkt...        transmit one packet (1..255 bytes)
- *   'S'               ask for a status frame
+ *   'S'               ask for a status frame (also a 2 s keepalive
+ *                     while the emulator holds the port)
  * modem -> PC
  *   'H' text          hello at boot, ASCII
  *   'R' rssi_lo rssi_hi snr pkt...   received packet, rssi int16 dBm,

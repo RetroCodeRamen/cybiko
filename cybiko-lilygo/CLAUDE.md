@@ -58,7 +58,7 @@ Cybiko LCD (160x100 grayscale) → 256-entry grayscale-to-RGB565 LUT → 2x near
 
 ### Keyboard Pipeline
 
-T-Deck keyboard (I2C ASCII) → `process_ascii_key()` maps to Cybiko 10-column matrix positions → synthetic key hold/release with frame-based timing (4 frames ≈ 67ms) → Fn+digit two-phase state machine for number input.
+T-Deck keyboard (I2C ASCII, drained by its own task) → `process_ascii_key()` maps to Cybiko matrix positions → typed keys are queued taps, one at a time: held 12 frames, then all keys up for 3 frames before the next. CyOS 1.2.46 misses a key held under 10 frames now and then, and a second tap of a key that is still down would only lengthen it ("ll" became "l"). `tools/v1_chat.sh` measured both.
 
 ### SD Card Layout
 
@@ -80,7 +80,7 @@ CyOS generates audio through Timer16 channel 1 hardware output compare, NOT manu
 
 ### Machine selection
 
-`lib/cybiko_core/src/core/machine.h` selects the machine at compile time: `-DCYBIKO_MACHINE_V1` for the Cybiko Classic, XT by default. Every memory-map and port constant that differs between them lives there, and the bus fast paths depend on them being constants. V1 boots CyOS 1.2.46 to the desktop on the host; its radio (SCI0) is not done. Build it with `pio run -e T-Deck-Cybiko-V1` (stride 12, card folder `/cybiko-v1/`). It holds 60 fps from power-on, so audio never runs dry. Stride 8 needed more guest instructions per frame than the T-Deck runs. `tools/v1_boot.sh <boot> <flash> [frames] [screen.pgm]` prints the Java emulator's STATUS line (frame, PC, halted, CRC-32 of VRAM) every 60 frames for side-by-side comparison. See `../PLAN-V1.md`. After touching `machine.h` or the bus, the XT hashes from `tools/host_bench.sh` must not change.
+`lib/cybiko_core/src/core/machine.h` selects the machine at compile time: `-DCYBIKO_MACHINE_V1` for the Cybiko Classic, XT by default. Every memory-map and port constant that differs between them lives there, and the bus fast paths depend on them being constants. V1 boots CyOS 1.2.46 to the desktop on the host, and Chat works between two Classics: `tools/v1_chat.sh <boot> <flash> [frames] [screens dir]` walks both into Chat (MAIN), types on each and checks the other received it. CyOS schedules its own radio (random back-off on TMR1's overflow interrupt); `sci0_v1.c` only models the UART, hands received frames to CyOS while its radio is idle, and sets the CyID. Do not add a poll/scan driver back: the Java one existed only because TMR1's OVI never fired. Build it with `pio run -e T-Deck-Cybiko-V1` (stride 12, card folder `/cybiko-v1/`). It holds 60 fps from power-on, so audio never runs dry. Stride 8 needed more guest instructions per frame than the T-Deck runs. `tools/v1_boot.sh <boot> <flash> [frames] [screen.pgm]` prints the Java emulator's STATUS line (frame, PC, halted, CRC-32 of VRAM) every 60 frames for side-by-side comparison. See `../PLAN-V1.md`. After touching `machine.h` or the bus, the XT hashes from `tools/host_bench.sh` must not change.
 
 ### Timer and SCI2 batching (performance-critical)
 

@@ -22,7 +22,7 @@ void cybiko_attach_radio_id(cybiko_emu_t *emu, struct cybiko_radio_coproc *copro
 
 /* Classic radio progress, for logs and tests. False on the Xtreme. */
 typedef struct {
-    bool rf_armed, rf_resolved, bootstrapped;
+    bool radio_up;          /* CyOS has finished its first radio frame */
     uint32_t tx_frames;     /* frames CyOS finished sending */
     uint32_t rx_injected;   /* received frames handed to CyOS */
 } cybiko_v1_radio_status_t;

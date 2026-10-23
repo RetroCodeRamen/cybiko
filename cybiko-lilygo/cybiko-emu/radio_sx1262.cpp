@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <esp_mac.h>
+#include <esp_random.h>
 
 #include "tdeck_pins.h"
 
@@ -37,6 +38,7 @@ int cybiko_sx1262_begin(bool (*bus_free)(void)) {
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     device_id = 0x4C000000u | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
     cybiko_lora_init(&link_t, cybiko_sx1262_phy(), device_id, CYBIKO_RADIO_TX != 0);
+    cybiko_lora_seed_msg_id(&link_t, esp_random());
     started = true;
     return 0;
 }

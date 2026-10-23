@@ -1,6 +1,28 @@
 #include "radio_lora.h"
+#include "radio_log.h"
 
 #include <string.h>
+#ifndef ARDUINO
+#include <stdio.h>
+#include <stdarg.h>
+void cybiko_radio_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+#endif
+
+static void radio_snip(char *dst, size_t cap, const uint8_t *d, size_t n) {
+    size_t o = 0, i;
+    if (!dst || cap == 0) return;
+    i = n > 19 ? 19 : 0;   /* Chat text starts at 19 */
+    for (; i < n && o + 1 < cap && o < 20; i++) {
+        unsigned char c = d[i];
+        dst[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    dst[o] = 0;
+}
 
 static int lora_start(cybiko_radio_transport_t *self) {
     (void)self;
@@ -21,13 +43,6 @@ static void lora_set_listener(cybiko_radio_transport_t *self,
     t->fn_user = user;
 }
 
-/* Guest payload after the 8-byte RF header is stripped: byte 0 is
- * 0xC0|channel, byte 1 is the frame type (0x01 = presence beacon),
- * bytes 12-19 are the nickname. Sequence/CRC bytes still change. */
-static bool lora_is_beacon(const uint8_t *data, size_t len) {
-    return data && len >= 20 && len <= 50 && data[1] == 0x01;
-}
-
 static int lora_send(cybiko_radio_transport_t *self,
                      const uint8_t *data, size_t len, uint8_t channel) {
     cybiko_lora_t *t = self->impl;
@@ -35,12 +50,11 @@ static int lora_send(cybiko_radio_transport_t *self,
         t->stats.tx_rejected++;
         return -1;
     }
-    if (lora_is_beacon(data, len) && t->last_beacon_set &&
-        data[0] == t->last_beacon_ch &&
-        memcmp(data + 12, t->last_beacon_name, 8) == 0 &&
-        t->pumps - t->last_beacon_pump < CYBIKO_LORA_BEACON_HOLD_PUMPS) {
-        t->stats.tx_held++;
-        return 0;   /* CyOS already transmitted; keep it off the air */
+    {
+        char snip[24];
+        radio_snip(snip, sizeof snip, data, len);
+        cybiko_radio_log("tx type=%02X len=%zu %s\n",
+                         len > 1 ? data[1] : 0, len, snip);
     }
     uint8_t pkts[CYBIKO_LINK_MAX_FRAGS][CYBIKO_LINK_MAX_PHYS];
     uint16_t lens[CYBIKO_LINK_MAX_FRAGS];
@@ -60,12 +74,6 @@ static int lora_send(cybiko_radio_transport_t *self,
         t->txq_count++;
     }
     t->stats.tx_msgs++;
-    if (lora_is_beacon(data, len)) {
-        t->last_beacon_set = true;
-        t->last_beacon_ch = data[0];
-        memcpy(t->last_beacon_name, data + 12, 8);
-        t->last_beacon_pump = t->pumps;
-    }
     return 0;
 }
 
@@ -89,20 +97,14 @@ static void lora_pump(cybiko_radio_transport_t *self) {
         if (rc < 0) {
             t->stats.rx_bad++;
         } else if (rc == 1) {
-            if (lora_is_beacon(out, out_len) && t->last_rx_beacon_set &&
-                sender == t->last_rx_beacon_from &&
-                memcmp(out + 12, t->last_rx_beacon_name, 8) == 0 &&
-                t->pumps - t->last_rx_beacon_pump < CYBIKO_LORA_BEACON_HOLD_PUMPS) {
-                t->stats.rx_held++;
-                continue;
+            {
+                char snip[24];
+                radio_snip(snip, sizeof snip, out, out_len);
+                cybiko_radio_log("rx type=%02X len=%zu from %08X %s\n",
+                                 out_len > 1 ? out[1] : 0, out_len,
+                                 (unsigned)sender, snip);
             }
             t->stats.rx_msgs++;
-            if (lora_is_beacon(out, out_len)) {
-                t->last_rx_beacon_set = true;
-                t->last_rx_beacon_from = sender;
-                memcpy(t->last_rx_beacon_name, out + 12, 8);
-                t->last_rx_beacon_pump = t->pumps;
-            }
             if (t->fn)
                 t->fn(t->fn_user, out, out_len, channel, sender);
         }
@@ -131,6 +133,10 @@ void cybiko_lora_init(cybiko_lora_t *t, cybiko_radio_phy_t *phy,
     t->base.set_channel = lora_set_channel;
     t->base.set_listener = lora_set_listener;
     t->base.pump = lora_pump;
+}
+
+void cybiko_lora_seed_msg_id(cybiko_lora_t *t, uint32_t seed) {
+    t->next_msg_id = (uint16_t)(seed ^ (seed >> 16));
 }
 
 void cybiko_lora_set_tx_enabled(cybiko_lora_t *t, bool on) {

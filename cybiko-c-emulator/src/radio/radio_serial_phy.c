@@ -11,7 +11,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -145,6 +151,15 @@ static void phy_poll(cybiko_radio_phy_t *self) {
         s->stats.tx_lost++;
         s->tx_busy = 0;
     }
+    /* Keep the Heltec OLED "EMU ON" while this process holds the port. */
+    if (!s->tx_busy) {
+        uint64_t t = now_ms();
+        if (t - s->last_status_ms >= 2000) {
+            static const uint8_t q = 'S';
+            if (send_frame(s, &q, 1) == 0)
+                s->last_status_ms = t;
+        }
+    }
 }
 
 static int phy_tx(cybiko_radio_phy_t *self, const uint8_t *pkt, size_t len) {
@@ -179,6 +194,84 @@ static int phy_rx(cybiko_radio_phy_t *self, uint8_t *buf, size_t cap, size_t *le
     return 1;
 }
 
+#ifndef _WIN32
+static void read_comm(int pid, char *dst, size_t cap) {
+    char path[64];
+    FILE *f;
+    snprintf(path, sizeof path, "/proc/%d/comm", pid);
+    dst[0] = 0;
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    if (fgets(dst, (int)cap, f)) {
+        size_t n = strlen(dst);
+        while (n && (dst[n - 1] == '\n' || dst[n - 1] == '\r'))
+            dst[--n] = 0;
+    }
+    fclose(f);
+}
+
+/* Another process already holding this char device. Linux allows two
+ * opens of the same tty; both would then drive CyRadio. */
+static int port_holder(const char *path, int self, char *cmd, size_t cap) {
+    struct stat want;
+    DIR *proc;
+    struct dirent *ent;
+    int found = 0;
+    if (stat(path, &want) != 0 || !S_ISCHR(want.st_mode))
+        return 0;
+    proc = opendir("/proc");
+    if (!proc)
+        return 0;
+    while (!found && (ent = readdir(proc)) != NULL) {
+        DIR *fds;
+        struct dirent *fe;
+        char fdpath[64];
+        int pid;
+        if (!isdigit((unsigned char)ent->d_name[0]))
+            continue;
+        pid = atoi(ent->d_name);
+        if (pid <= 0 || pid == self)
+            continue;
+        snprintf(fdpath, sizeof fdpath, "/proc/%s/fd", ent->d_name);
+        fds = opendir(fdpath);
+        if (!fds)
+            continue;
+        while ((fe = readdir(fds)) != NULL) {
+            char link[80], target[PATH_MAX];
+            struct stat got;
+            ssize_t n;
+            if (fe->d_name[0] == '.')
+                continue;
+            snprintf(link, sizeof link, "/proc/%s/fd/%s", ent->d_name, fe->d_name);
+            n = readlink(link, target, sizeof target - 1);
+            if (n <= 0)
+                continue;
+            target[n] = 0;
+            if (stat(target, &got) != 0 || !S_ISCHR(got.st_mode))
+                continue;
+            if (got.st_rdev != want.st_rdev)
+                continue;
+            found = pid;
+            if (cmd && cap)
+                read_comm(pid, cmd, cap);
+            break;
+        }
+        closedir(fds);
+    }
+    closedir(proc);
+    return found;
+}
+
+static void report_busy(const char *path, int pid, const char *cmd) {
+    if (pid > 0)
+        fprintf(stderr, "CyRadio %s already in use by pid %d (%s)\n",
+                path, pid, cmd && cmd[0] ? cmd : "?");
+    else
+        fprintf(stderr, "CyRadio %s already in use by another process\n", path);
+}
+#endif
+
 #ifdef _WIN32
 static void win_serial_path(const char *path, char *out, size_t cap) {
     if (strncmp(path, "\\\\.\\", 4) == 0 || strncmp(path, "//./", 4) == 0) {
@@ -200,8 +293,14 @@ int cybiko_serial_phy_open(cybiko_serial_phy_t *s, const char *path) {
                     OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
-        errno = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
-            ? ENOENT : (e == ERROR_ACCESS_DENIED ? EACCES : EIO);
+        if (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) {
+            fprintf(stderr, "CyRadio %s already in use by another emulator\n", path);
+            errno = EBUSY;
+        } else if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
+            errno = ENOENT;
+        } else {
+            errno = EIO;
+        }
         return -1;
     }
     memset(&dcb, 0, sizeof dcb);
@@ -254,11 +353,31 @@ void cybiko_serial_phy_close(cybiko_serial_phy_t *s) {
 }
 #else
 int cybiko_serial_phy_open(cybiko_serial_phy_t *s, const char *path) {
+    char cmd[64] = "";
+    int holder;
     memset(s, 0, sizeof *s);
     s->fd = -1;
+    holder = port_holder(path, (int)getpid(), cmd, sizeof cmd);
+    if (holder > 0) {
+        report_busy(path, holder, cmd);
+        errno = EBUSY;
+        return -1;
+    }
     s->fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (s->fd < 0)
         return -1;
+    if (flock((int)s->fd, LOCK_EX | LOCK_NB) != 0) {
+        int e = errno;
+        holder = port_holder(path, (int)getpid(), cmd, sizeof cmd);
+        report_busy(path, holder, cmd);
+        close((int)s->fd);
+        s->fd = -1;
+        errno = e ? e : EBUSY;
+        return -1;
+    }
+#ifdef TIOCEXCL
+    ioctl((int)s->fd, TIOCEXCL);
+#endif
     struct termios tio;
     if (tcgetattr((int)s->fd, &tio) != 0)
         goto fail;
@@ -301,5 +420,6 @@ void cybiko_serial_phy_close(cybiko_serial_phy_t *s) {
 
 void cybiko_serial_phy_request_status(cybiko_serial_phy_t *s) {
     static const uint8_t q = 'S';
-    send_frame(s, &q, 1);
+    if (send_frame(s, &q, 1) == 0)
+        s->last_status_ms = now_ms();
 }

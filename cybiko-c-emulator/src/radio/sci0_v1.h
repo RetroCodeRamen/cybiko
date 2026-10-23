@@ -2,27 +2,25 @@
 #define CYBIKO_SCI0_V1_H
 
 /*
- * Cybiko Classic (V1) SCI0, interrupt driven, to the radio co-processor,
- * plus the CyOS 1.2.46 radio driver workarounds.
+ * Cybiko Classic (V1) SCI0, interrupt driven, to the radio co-processor.
  *
  * Behavior follows AddressBus.java (MIT, Copyright 2026 Dan Berkowitz):
- * tickSci0, tickV1Radio, the SCI0 SCR write, and CybikoEmulator's
- * set_task_state hook. CyOS sends a poll/scan command and the frame byte by
- * byte from TXI0; clearing TIE ends the frame, and the co-processor answers
- * 0x03, an indicator and 50/200 bytes through RXI0.
+ * tickSci0 and the SCI0 SCR write. CyOS sends a poll/scan command and the
+ * frame byte by byte from TXI0; clearing TIE ends the frame, and the
+ * co-processor answers 0x03, an indicator and 50/200 bytes through RXI0.
  *
- * The workarounds are tied to CyOS 1.2.46 RAM addresses (radio object
- * pointer 0x21F216, CyID 0x21F9DC, RF object 0x223186), each read checked
- * against the RAM range before use:
- *  - bootstrap: connObj is only allocated by a completion handler that
- *    needs connObj, so state 9 plus an injected 0x03 starts it;
- *  - poll/scan: in emulation CyOS never calls its radio tick, so one is
- *    started every 180 frames (3 s). Java used 15 (4/s); that rate would
- *    fill a LoRa channel by itself and starve the key scan. Unchanged
- *    beacons are also held in radio_lora.c so several radios can share
- *    the air. Poll, async RX, and RDR load wait while a key is down;
- *  - RF service: set_task_state never resolves the RF object, so the first
- *    call after the desktop is up does it.
+ * CyOS 1.2.46 schedules its own radio. Posting a job (0x214A6C) or
+ * finishing one calls the tick at 0x214760 with a random back-off; the
+ * tick loads TMR1 and enables its overflow interrupt, and that interrupt
+ * calls the tick again, which starts TXI0. Java and this file used to
+ * fake the tick with a poll/scan driver because TMR1's OVI never fired
+ * (timer8 raised OVI only on a 0 -> 1 OVF edge, and OVF stayed set). The
+ * driver guessed Chat from connObj bytes and was the cause of lost and
+ * echoed messages. With TMR1 fixed, only two things are left here:
+ *  - async RX: the co-processor hands CyOS a received frame while its
+ *    radio is idle (state 1), as the AVR does;
+ *  - identity: the CyID cache at 0x21F9DC is set to radio_id, because
+ *    both ends usually boot the same flash.bin.
  */
 
 #include "radio_coproc.h"
@@ -43,9 +41,6 @@ extern "C" {
 #define CYBIKO_SCI0_RXI_VECTOR 81
 #define CYBIKO_SCI0_TXI_VECTOR 82
 
-/* CyOS 1.2.46 set_task_state, hooked to resolve the RF service */
-#define CYBIKO_V1_SET_TASK_STATE 0x205088u
-
 typedef uint8_t (*cybiko_sci0_read_fn)(void *ctx, uint32_t address);
 typedef void (*cybiko_sci0_poke_fn)(void *ctx, uint32_t address, uint8_t value);
 typedef void (*cybiko_sci0_irq_fn)(void *ctx, int vector);
@@ -59,24 +54,8 @@ typedef struct cybiko_sci0_v1 {
     uint8_t rdr;
     int txi_delay;          /* cycles until TDRE */
     int async_countdown;    /* cycles until the next async check */
-    /* bootstrap */
-    bool bootstrapped;
-    bool bootstrap_pending;
-    int64_t bootstrap_wait; /* cycles */
-    uint32_t saved_conn;
-    /* poll/scan driver */
-    int poll_frames;
-    int poll_alt;
-    bool driver_tx;
-    /* Guest has a key down: do not start a poll/scan or inject RX this
-     * frame. Radio ECC is a full frame of work and starved the UI. */
-    bool input_busy;
-    /* identity */
+    bool radio_up;          /* CyOS has finished its first frame */
     uint32_t radio_id;      /* 0 = keep the ROM CyID */
-    bool cyid_patched;
-    /* RF service */
-    bool rf_armed;          /* set by the host once the desktop is up */
-    bool rf_resolved;
     cybiko_sci0_read_fn read8;
     cybiko_sci0_poke_fn poke8;
     cybiko_sci0_irq_fn irq;
@@ -97,10 +76,8 @@ bool cybiko_sci0_read(cybiko_sci0_v1_t *s, uint32_t address, uint8_t *out);
 void cybiko_sci0_on_reg(cybiko_sci0_v1_t *s, int reg, uint8_t value);
 /* Advance by guest cycles. */
 void cybiko_sci0_advance(cybiko_sci0_v1_t *s, int cycles);
-/* Once per frame: the poll/scan driver. */
+/* Once per frame: keeps the CyID set. */
 void cybiko_sci0_frame(cybiko_sci0_v1_t *s);
-/* The CPU reached CYBIKO_V1_SET_TASK_STATE. */
-void cybiko_sci0_on_set_task_state(cybiko_sci0_v1_t *s);
 
 #ifdef __cplusplus
 }

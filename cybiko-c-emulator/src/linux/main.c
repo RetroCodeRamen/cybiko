@@ -448,9 +448,9 @@ static void radio_on_text(void *user, char type, const char *text)
 
 static void radio_print_stats(const cybiko_lora_t *lt, const cybiko_serial_phy_t *sp)
 {
-    fprintf(stderr, "Radio: tx msgs %u pkts %u rejected %u held %u (modem sent %u timeout %u "
+    fprintf(stderr, "Radio: tx msgs %u pkts %u rejected %u (modem sent %u timeout %u "
             "refused %u lost %u)  rx pkts %u msgs %u bad %u  rssi %d snr %d\n",
-            lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_rejected, lt->stats.tx_held,
+            lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_rejected,
             sp->stats.tx_sent, sp->stats.tx_timeout, sp->stats.tx_refused,
             sp->stats.tx_lost, lt->stats.rx_pkts, lt->stats.rx_msgs, lt->stats.rx_bad,
             sp->stats.last_rssi_dbm, sp->stats.last_snr_db);
@@ -655,14 +655,17 @@ int main(int argc, char *argv[])
     bool radio_on = false;
     if (radio_path) {
         if (cybiko_serial_phy_open(&radio_phy, radio_path) != 0) {
-            fprintf(stderr, "Warning: radio '%s': %s, running without radio\n",
-                    radio_path, strerror(errno));
+            fprintf(stderr, "Warning: radio '%s': %s%s\n",
+                    radio_path, strerror(errno),
+                    errno == EBUSY ? " — another emulator already has CyRadio"
+                                   : ", running without radio");
         } else if (!cybiko_patch_cyid(emu, cyid)) {
             fprintf(stderr, "Warning: CyID patch failed, running without radio\n");
             cybiko_serial_phy_close(&radio_phy);
         } else {
             radio_phy.on_text = radio_on_text;
             cybiko_lora_init(&radio_link, &radio_phy.phy, cyid, true);
+            cybiko_lora_seed_msg_id(&radio_link, (uint32_t)SDL_GetPerformanceCounter());
             cybiko_radio_coproc_init(&radio_cop);
             cybiko_radio_coproc_set_transport(&radio_cop, &radio_link.base);
             cybiko_attach_radio(emu, &radio_cop);

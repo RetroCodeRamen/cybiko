@@ -37,15 +37,14 @@ static void report(int frame, cybiko_emu_t *e, const cybiko_radio_coproc_t *c,
                    const cybiko_lora_t *lt, const cybiko_serial_phy_t *sp) {
     cybiko_v1_radio_status_t st;
     cybiko_v1_radio_status(e, &st);
-    printf("frame %5d: rf %s%s boot %s  guest sent %u delivered %u  "
-           "coproc tx %u rx %u  lora tx msgs %u pkts %u held %u  "
+    printf("frame %5d: radio %s  guest sent %u delivered %u  "
+           "coproc tx %u rx %u  lora tx msgs %u pkts %u  "
            "rx pkts %u msgs %u bad %u  rssi %d snr %d\n",
            frame,
-           st.rf_armed ? "armed" : "-", st.rf_resolved ? "+up" : "",
-           st.bootstrapped ? "yes" : "no",
+           st.radio_up ? "up" : "-",
            st.tx_frames, st.rx_injected,
            c->stat_tx, c->stat_rx,
-           lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_held,
+           lt->stats.tx_msgs, lt->stats.tx_pkts,
            lt->stats.rx_pkts, lt->stats.rx_msgs, lt->stats.rx_bad,
            sp->stats.last_rssi_dbm, sp->stats.last_snr_db);
     fflush(stdout);
@@ -98,6 +97,7 @@ int main(int argc, char **argv) {
     }
     phy.on_text = radio_on_text;
     cybiko_lora_init(&link, &phy.phy, cyid, true);
+    cybiko_lora_seed_msg_id(&link, (uint32_t)time(NULL) ^ (uint32_t)getpid());
     cybiko_radio_coproc_init(&cop);
     cybiko_radio_coproc_set_transport(&cop, &link.base);
     cybiko_attach_radio_id(emu, &cop, cyid);

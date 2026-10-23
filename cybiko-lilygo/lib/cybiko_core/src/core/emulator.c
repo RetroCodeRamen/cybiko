@@ -50,8 +50,7 @@ struct cybiko_emu {
 #if CYBIKO_HAS_SPI_FLASH
     uint8_t *spi_flash;        /* AT45_SIZE, the Classic's CyOS and files */
     uint16_t prev_keys[CYBIKO_KEYBOARD_COLUMNS];
-    uint64_t v1_last_sleep;    /* radio: sleep_cycles at the last frame */
-    int      v1_idle_frames;   /* radio: consecutive mostly-asleep frames */
+    int      key_irq_retries;  /* extra IRQ2 if CyOS missed the edge */
 #endif
 
     bool     running;
@@ -281,33 +280,28 @@ void cybiko_run_frame(cybiko_emu_t *emu) {
                                CYBIKO_KEYBOARD_COLUMNS);
     }
 #ifdef CYBIKO_KEY_IRQ_VECTOR
-    /* V1 scans the matrix from IRQ2, raised on a key press */
-    for (int i = 0; i < CYBIKO_KEYBOARD_SCAN_COLS; i++) {
-        if (emu->keyboard.columns[i] & ~emu->prev_keys[i])
-            h8s_cpu_request_interrupt(&emu->cpu, CYBIKO_KEY_IRQ_VECTOR);
-        emu->prev_keys[i] = emu->keyboard.columns[i];
-    }
-#endif
-#if CYBIKO_HAS_SPI_FLASH
-    if (emu->bus.sci0.bound) {
-        bool keys = false;
+    /* V1 scans the matrix from IRQ2. Radio SCAN can eat the press-edge
+     * frame; without a retry CyOS never looks again and the key is lost. */
+    {
+        bool edge = false, down = false;
         for (int i = 0; i < CYBIKO_KEYBOARD_SCAN_COLS; i++) {
-            if (emu->keyboard.columns[i]) {
-                keys = true;
-                break;
-            }
+            if (emu->keyboard.columns[i] & ~emu->prev_keys[i])
+                edge = true;
+            if (emu->keyboard.columns[i])
+                down = true;
+            emu->prev_keys[i] = emu->keyboard.columns[i];
         }
-        /* Pulse keys last 3–4 frames. Keep radio quiet a little after so
-         * a 1 Hz poll cannot land between letters and eat the next scan. */
-        static int quiet;
-        if (keys)
-            quiet = 12;
-        else if (quiet > 0)
-            quiet--;
-        emu->bus.sci0.input_busy = keys || quiet > 0;
+        if (edge) {
+            h8s_cpu_request_interrupt(&emu->cpu, CYBIKO_KEY_IRQ_VECTOR);
+            emu->key_irq_retries = 3;
+        } else if (down && emu->key_irq_retries > 0) {
+            h8s_cpu_request_interrupt(&emu->cpu, CYBIKO_KEY_IRQ_VECTOR);
+            emu->key_irq_retries--;
+        } else if (!down) {
+            emu->key_irq_retries = 0;
+        }
     }
 #endif
-
     /* Begin speaker frame (record start level, reset transitions) */
     speaker_begin_frame(&emu->speaker);
 
@@ -396,20 +390,8 @@ void cybiko_run_frame(cybiko_emu_t *emu) {
     bus_tick_rtc(&emu->bus);
 
 #if CYBIKO_HAS_SPI_FLASH
-    if (emu->bus.sci0.bound) {
-        /* Arm the RF service hook once CyOS has idled for a second, which
-         * it first does at the desktop (Java waits for frame 540, its
-         * desktop at one instruction per cycle). */
-        if (!emu->bus.sci0.rf_armed) {
-            uint64_t slept = emu->sleep_cycles - emu->v1_last_sleep;
-            emu->v1_idle_frames = slept * 2 >= CYBIKO_CYCLES_PER_FRAME
-                                  ? emu->v1_idle_frames + 1 : 0;
-            if (emu->v1_idle_frames >= 60)
-                emu->bus.sci0.rf_armed = true;
-        }
-        emu->v1_last_sleep = emu->sleep_cycles;
+    if (emu->bus.sci0.bound)
         cybiko_sci0_frame(&emu->bus.sci0);
-    }
 #endif
 
     /* Drain serial output buffers to the HAL */
@@ -445,9 +427,7 @@ void cybiko_attach_radio_id(cybiko_emu_t *emu, struct cybiko_radio_coproc *copro
 bool cybiko_v1_radio_status(const cybiko_emu_t *emu, cybiko_v1_radio_status_t *out) {
 #if CYBIKO_HAS_SPI_FLASH
     const cybiko_sci0_v1_t *s = &emu->bus.sci0;
-    out->rf_armed = s->rf_armed;
-    out->rf_resolved = s->rf_resolved;
-    out->bootstrapped = s->bootstrapped;
+    out->radio_up = s->radio_up;
     out->tx_frames = s->tx_frames;
     out->rx_injected = s->rx_injected;
     return s->bound;

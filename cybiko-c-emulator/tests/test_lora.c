@@ -191,65 +191,26 @@ static void test_bad_packet_counted(void) {
     TEST_CHECK(got.count == 1);
 }
 
-static void make_beacon(uint8_t *b, size_t n, uint8_t ch, const char *name) {
-    memset(b, 0, n);
-    b[0] = (uint8_t)(0xC0 | (ch & 0x3F));
-    b[1] = 0x01;
-    b[8] = 0x2A;
-    size_t i = 0;
-    while (name[i] && i < 8) {
-        b[12 + i] = (uint8_t)name[i];
-        i++;
+/* A node that restarts begins its message ids again. Its peer still
+ * remembers the old ids and used to drop the new messages as repeats. */
+static void test_restart_with_new_seed(void) {
+    setup(CYBIKO_LORA_PHY_MAX, 1, true);
+    uint8_t x[42];
+    fill(x, sizeof x, 7);
+    for (int i = 0; i < 3; i++) {
+        TEST_CHECK(lora_a.base.send_packet(&lora_a.base, x, sizeof x, 2) == 0);
+        pump_both(4);
     }
-}
-
-static void test_unchanged_beacon_held(void) {
-    setup(CYBIKO_LORA_PHY_MAX, 1, true);
-    uint8_t b[42];
-    make_beacon(b, sizeof b, 2, "Cybiko");
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    TEST_CHECK(lora_a.stats.tx_msgs == 1 && lora_a.stats.tx_held == 0);
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    TEST_CHECK(lora_a.stats.tx_msgs == 1 && lora_a.stats.tx_held == 1);
-    TEST_CHECK(lora_a.txq_count == 1);
-    pump_both(CYBIKO_LORA_BEACON_HOLD_PUMPS);
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    TEST_CHECK(lora_a.stats.tx_msgs == 2 && lora_a.stats.tx_held == 1);
-    make_beacon(b, sizeof b, 2, "deck");
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    TEST_CHECK(lora_a.stats.tx_msgs == 3);   /* nickname change goes out */
-    uint8_t chat[192];
-    fill(chat, sizeof chat, 1);
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, chat, sizeof chat, 2) == 0);
-    TEST_CHECK(lora_a.stats.tx_msgs == 4);   /* chat is never held */
-}
-
-static void test_rx_unchanged_beacon_held(void) {
-    setup(CYBIKO_LORA_PHY_MAX, 1, true);
-    uint8_t b[42];
-    make_beacon(b, sizeof b, 2, "Cybiko");
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    pump_both(5);
-    TEST_CHECK(got.count == 1 && lora_b.stats.rx_msgs == 1);
-    TEST_CHECK(lora_b.stats.rx_held == 0);
-    lora_a.last_beacon_set = false;   /* TX hold would otherwise eat this */
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    pump_both(5);
-    TEST_CHECK(got.count == 1 && lora_b.stats.rx_msgs == 1);
-    TEST_CHECK(lora_b.stats.rx_held == 1);
-    pump_both(CYBIKO_LORA_BEACON_HOLD_PUMPS);
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    pump_both(5);
-    TEST_CHECK(got.count == 2 && lora_b.stats.rx_msgs == 2);
-    make_beacon(b, sizeof b, 2, "deck");
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, b, sizeof b, 2) == 0);
-    pump_both(5);
-    TEST_CHECK(got.count == 3);   /* nickname change is delivered */
-    uint8_t chat[192];
-    fill(chat, sizeof chat, 1);
-    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, chat, sizeof chat, 2) == 0);
-    pump_both(8);
-    TEST_CHECK(got.count == 4);   /* chat is never held */
+    TEST_CHECK(got.count == 3);
+    cybiko_lora_init(&lora_a, &phy_a.base, 0x10000001u, true);   /* restart */
+    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, x, sizeof x, 2) == 0);
+    pump_both(4);
+    TEST_CHECK(got.count == 3);   /* id 1 again: dropped as a repeat */
+    cybiko_lora_init(&lora_a, &phy_a.base, 0x10000001u, true);
+    cybiko_lora_seed_msg_id(&lora_a, 0x5A5A1234u);
+    TEST_CHECK(lora_a.base.send_packet(&lora_a.base, x, sizeof x, 2) == 0);
+    pump_both(4);
+    TEST_CHECK(got.count == 4);
 }
 
 static void test_both_directions(void) {
@@ -271,7 +232,6 @@ TEST_LIST = {
     { "full queue rejects the whole message", test_queue_full_is_all_or_nothing },
     { "bad packet is counted, not delivered", test_bad_packet_counted },
     { "both directions at once", test_both_directions },
-    { "unchanged beacon is held, chat is not", test_unchanged_beacon_held },
-    { "unchanged RX beacon is held, chat is not", test_rx_unchanged_beacon_held },
+    { "restarted sender with a new seed is not a repeat", test_restart_with_new_seed },
     { NULL, NULL }
 };

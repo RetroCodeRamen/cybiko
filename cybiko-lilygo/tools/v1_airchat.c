@@ -205,14 +205,12 @@ static void report(int frame, cybiko_emu_t *e, const cybiko_radio_coproc_t *c,
     (void)c;
     cybiko_v1_radio_status_t st;
     cybiko_v1_radio_status(e, &st);
-    printf("frame %5d: rf %s%s boot %s  guest sent %u delivered %u  "
-           "lora tx %u held %u rx %u held %u  rssi %d  peer '%s' beacons %d chat rx %d tx %d  tdeck %s\n",
+    printf("frame %5d: radio %s  guest sent %u delivered %u  "
+           "lora tx %u rx %u  rssi %d  peer '%s' beacons %d chat rx %d tx %d  tdeck %s\n",
            frame,
-           st.rf_armed ? "armed" : "-", st.rf_resolved ? "+up" : "",
-           st.bootstrapped ? "yes" : "no",
+           st.radio_up ? "up" : "-",
            st.tx_frames, st.rx_injected,
-           lt->stats.tx_pkts, lt->stats.tx_held, lt->stats.rx_msgs,
-           lt->stats.rx_held,
+           lt->stats.tx_pkts, lt->stats.rx_msgs,
            sp->stats.last_rssi_dbm, peer_name[0] ? peer_name : "-",
            beacons, chats_rx, chats_tx,
            tdeck_fd < 0 ? "none" : (tdeck_idle ? "idle" : "boot"));
@@ -274,6 +272,7 @@ int main(int argc, char **argv) {
     }
     phy.on_text = radio_on_text;
     cybiko_lora_init(&link, &phy.phy, cyid, true);
+    cybiko_lora_seed_msg_id(&link, (uint32_t)time(NULL) ^ (uint32_t)getpid());
     cybiko_radio_coproc_init(&cop);
     cybiko_radio_coproc_set_transport(&cop, &link.base);
     cybiko_attach_radio_id(emu, &cop, cyid);
@@ -386,7 +385,7 @@ int main(int argc, char **argv) {
             cybiko_v1_radio_status(emu, &st);
             int desk = ram && (contains(ram, ram_n, "You & Me") ||
                                contains(ram, ram_n, "Main Desktop"));
-            if (st.bootstrapped && st.rx_injected > 0 && st.tx_frames > 0 &&
+            if (st.radio_up && st.rx_injected > 0 && st.tx_frames > 0 &&
                 (desk || frame > 7000)) {
                 phase = 1;
                 phase_frame = frame;

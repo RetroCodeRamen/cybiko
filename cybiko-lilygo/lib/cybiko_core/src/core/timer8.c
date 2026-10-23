@@ -61,6 +61,10 @@ uint8_t timer8_read(const timer8_t *t, int reg) {
 void timer8_write(timer8_t *t, int reg, uint8_t value) {
     switch (reg) {
     case 0:
+        /* OVI is level-sensitive (OVF and OVIE). CyOS V1 arms its radio
+         * back-off by enabling OVIE on TMR1 while a stale OVF is set. */
+        if ((value & TCR_OVIE) && !(t->tcr & TCR_OVIE) && (t->tcsr & TCSR_OVF))
+            h8s_cpu_request_interrupt(t->cpu, t->vec_ovi);
         t->tcr = value;
         t->cached_divisor = clock_divisors[value & 0x07];
         break;
@@ -114,8 +118,9 @@ void timer8_event(timer8_t *t) {
         }
     }
 
-    /* Check overflow (only on natural wrap 0xFF -> 0x00) */
-    if (t->tcnt == 0 && !(t->tcsr & TCSR_OVF)) {
+    /* Check overflow (only on natural wrap 0xFF -> 0x00). OVF may still
+     * be set from an earlier wrap; the interrupt follows OVF and OVIE. */
+    if (t->tcnt == 0) {
         t->tcsr |= TCSR_OVF;
         if (t->tcr & TCR_OVIE) {
             h8s_cpu_request_interrupt(t->cpu, t->vec_ovi);
