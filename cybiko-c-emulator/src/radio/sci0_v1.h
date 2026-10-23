@@ -17,7 +17,10 @@
  *  - bootstrap: connObj is only allocated by a completion handler that
  *    needs connObj, so state 9 plus an injected 0x03 starts it;
  *  - poll/scan: in emulation CyOS never calls its radio tick, so one is
- *    started every 15 frames;
+ *    started every 180 frames (3 s). Java used 15 (4/s); that rate would
+ *    fill a LoRa channel by itself and starve the key scan. Unchanged
+ *    beacons are also held in radio_lora.c so several radios can share
+ *    the air. Poll, async RX, and RDR load wait while a key is down;
  *  - RF service: set_task_state never resolves the RF object, so the first
  *    call after the desktop is up does it.
  */
@@ -65,6 +68,9 @@ typedef struct cybiko_sci0_v1 {
     int poll_frames;
     int poll_alt;
     bool driver_tx;
+    /* Guest has a key down: do not start a poll/scan or inject RX this
+     * frame. Radio ECC is a full frame of work and starved the UI. */
+    bool input_busy;
     /* identity */
     uint32_t radio_id;      /* 0 = keep the ROM CyID */
     bool cyid_patched;

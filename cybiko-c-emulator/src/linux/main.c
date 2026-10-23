@@ -448,9 +448,9 @@ static void radio_on_text(void *user, char type, const char *text)
 
 static void radio_print_stats(const cybiko_lora_t *lt, const cybiko_serial_phy_t *sp)
 {
-    fprintf(stderr, "Radio: tx msgs %u pkts %u rejected %u (modem sent %u timeout %u "
+    fprintf(stderr, "Radio: tx msgs %u pkts %u rejected %u held %u (modem sent %u timeout %u "
             "refused %u lost %u)  rx pkts %u msgs %u bad %u  rssi %d snr %d\n",
-            lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_rejected,
+            lt->stats.tx_msgs, lt->stats.tx_pkts, lt->stats.tx_rejected, lt->stats.tx_held,
             sp->stats.tx_sent, sp->stats.tx_timeout, sp->stats.tx_refused,
             sp->stats.tx_lost, lt->stats.rx_pkts, lt->stats.rx_msgs, lt->stats.rx_bad,
             sp->stats.last_rssi_dbm, sp->stats.last_snr_db);

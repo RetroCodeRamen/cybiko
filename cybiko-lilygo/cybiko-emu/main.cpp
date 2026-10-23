@@ -21,6 +21,10 @@ extern "C" {
 #include "tdeck_keymap.h"
 #include "radio_sx1262.h"
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "soc/usb_serial_jtag_struct.h"
+#endif
+
 // ---------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------
@@ -140,7 +144,8 @@ static void render_frame_body(const uint8_t *pixels, int w, int h) {
 
 // Synthetic key release tracking
 #define MAX_ACTIVE_KEYS 8
-#define KEY_HOLD_FRAMES 4  // ~67ms at 60fps
+#define KEY_HOLD_FRAMES 4     // ~67ms at 60fps; CyOS sees this many run_frames
+#define KEY_HOLD_STICKY (-1)  // stays down until release_key()
 
 static uint16_t key_matrix[CYBIKO_KEYBOARD_COLUMNS];
 
@@ -162,7 +167,9 @@ static bool fn_pending = false;
 static void press_key(int col, uint16_t mask) {
     for (int i = 0; i < active_key_count; i++) {
         if (active_keys[i].col == col && active_keys[i].mask == mask) {
-            active_keys[i].frames_left = KEY_HOLD_FRAMES;
+            if (active_keys[i].frames_left != KEY_HOLD_STICKY)
+                active_keys[i].frames_left = KEY_HOLD_FRAMES;
+            key_matrix[col] |= mask;
             return;
         }
     }
@@ -175,8 +182,40 @@ static void press_key(int col, uint16_t mask) {
     key_matrix[col] |= mask;
 }
 
+static void hold_key(int col, uint16_t mask) {
+    for (int i = 0; i < active_key_count; i++) {
+        if (active_keys[i].col == col && active_keys[i].mask == mask) {
+            active_keys[i].frames_left = KEY_HOLD_STICKY;
+            key_matrix[col] |= mask;
+            return;
+        }
+    }
+    if (active_key_count < MAX_ACTIVE_KEYS) {
+        active_keys[active_key_count].col = col;
+        active_keys[active_key_count].mask = mask;
+        active_keys[active_key_count].frames_left = KEY_HOLD_STICKY;
+        active_key_count++;
+    }
+    key_matrix[col] |= mask;
+}
+
+static void release_key(int col, uint16_t mask) {
+    key_matrix[col] &= ~mask;
+    for (int i = 0; i < active_key_count; i++) {
+        if (active_keys[i].col == col && active_keys[i].mask == mask) {
+            active_keys[i] = active_keys[active_key_count - 1];
+            active_key_count--;
+            return;
+        }
+    }
+}
+
 static void keyboard_tick_frame(void) {
     for (int i = 0; i < active_key_count; ) {
+        if (active_keys[i].frames_left == KEY_HOLD_STICKY) {
+            i++;
+            continue;
+        }
         active_keys[i].frames_left--;
         if (active_keys[i].frames_left <= 0) {
             key_matrix[active_keys[i].col] &= ~active_keys[i].mask;
@@ -216,21 +255,39 @@ static void process_ascii_key(char c) {
 // The trackball generates brief LOW pulses per step — too short to
 // reliably catch by polling at ~20fps.  ISRs count every pulse, then
 // poll_input() converts accumulated counts into synthetic held presses.
+#define TRACKBALL_CLICK_DEBOUNCE_MS 30
+#define TRACKBALL_ESC_MS            600
 static volatile int tb_up_count    = 0;
 static volatile int tb_down_count  = 0;
 static volatile int tb_left_count  = 0;
 static volatile int tb_right_count = 0;
+static volatile uint32_t tb_click_down_ms;
+static volatile uint8_t  tb_click_isr_down;
 
 static void IRAM_ATTR tb_up_isr()    { tb_up_count++; }
 static void IRAM_ATTR tb_down_isr()  { tb_down_count++; }
 static void IRAM_ATTR tb_left_isr()  { tb_left_count++; }
 static void IRAM_ATTR tb_right_isr() { tb_right_count++; }
 
+static void IRAM_ATTR tb_click_isr() {
+    uint32_t now = millis();
+    if (!now) now = 1;
+    if (!digitalRead(PIN_TRACKBALL_CLICK)) {
+        if (!tb_click_isr_down) {
+            tb_click_isr_down = 1;
+            tb_click_down_ms = now;
+        }
+    } else {
+        tb_click_isr_down = 0;
+    }
+}
+
 static void init_trackball_interrupts(void) {
     attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_UP),    tb_up_isr,    FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_DOWN),  tb_down_isr,  FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_LEFT),  tb_left_isr,  FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_RIGHT), tb_right_isr, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_TRACKBALL_CLICK), tb_click_isr, CHANGE);
 }
 
 #ifdef CYBIKO_SPLIT_PROFILE
@@ -248,11 +305,28 @@ static void press_special(tdeck_special_key_t k) {
 // command key: $ then a letter sends one of them ($x = Esc). Shift+$
 // (code 4) and $v step the volume.
 static bool cmd_pending;
+static char chrome_top[40] = "Cybiko";
+
+static void draw_chrome(void) {
+    tft.dmaWait();
+    tft.fillRect(0, 0, SCALED_W, BORDER_TOP, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    if (chrome_top[0])
+        tft.drawString(chrome_top, 4, 2, 2);
+    if (cmd_pending) {
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString("$", 300, 2, 2);
+    }
+    tft.fillRect(0, BORDER_BOTTOM, SCALED_W, 240 - BORDER_BOTTOM, TFT_BLACK);
+    tft.setTextColor(cmd_pending ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+    tft.drawString(cmd_pending ? "$x Esc  $h Help  $q-u F1-7" :
+                                 "$ then x=Esc h=Help q-u=F1-7",
+                   4, BORDER_BOTTOM + 2, 2);
+}
 
 static void show_cmd(bool on) {
-    tft.dmaWait();
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(on ? "$ cmd" : "     ", 270, 2, 2);
+    (void)on;
+    draw_chrome();
 }
 
 static void handle_key(char c) {
@@ -292,10 +366,11 @@ static void handle_key(char c) {
 
 static void poll_input(void) {
     {
-        Wire.requestFrom(KB_I2C_ADDR, (int)1);
-        while (Wire.available() > 0) {
-            char c = Wire.read();
-            if (c != 0x00) {
+        int n = Wire.requestFrom(KB_I2C_ADDR, (int)1);
+        while (n > 0 && Wire.available() > 0) {
+            uint8_t c = (uint8_t)Wire.read();
+            n--;
+            if (c != 0x00 && c != 0xFF) {
                 static int kb_log = 0;
 #ifdef CYBIKO_KEYLOG
                 // Every byte the keyboard sends, for mapping spare keys
@@ -338,27 +413,63 @@ static void poll_input(void) {
     if (down > 0)  press_key(TDECK_PAD_DOWN_COL, TDECK_PAD_DOWN_MASK);
     if (left > 0)  press_key(TDECK_PAD_LEFT_COL, TDECK_PAD_LEFT_MASK);
     if (right > 0) press_key(TDECK_PAD_RIGHT_COL, TDECK_PAD_RIGHT_MASK);
+    if (up | down | left | right)
+        boot_done = true;
 
-    /* A click is Enter, the key CyOS uses to leave the welcome pages and
-     * to open an icon (Select does not launch). Holding the ball down for
-     * half a second is Esc, which the T-Deck keyboard lacks. Enter is sent
-     * on release so a hold does not also open something. */
+    /* A click shorter than 600 ms is Enter, the key CyOS uses to leave
+     * the welcome pages and to open an icon (Select does not launch).
+     * Holding the ball down that long is Esc, which the T-Deck keyboard
+     * lacks. Enter is sent on release so a hold does not also open
+     * something. Esc stays down for the rest of the hold: a 4-frame pulse
+     * was too short for CyOS 1.2.46's scan, and bounce on GPIO 0 turned a
+     * hold into Enter. The click ISR timestamps the press so a slow frame
+     * cannot restart the hold timer. */
     static uint32_t click_since;
-    static bool esc_sent;
-    bool clicked = !digitalRead(PIN_TRACKBALL_CLICK);
+    static uint32_t click_up_since;
+    static bool click_down;
+    static bool esc_held;
+    bool raw = !digitalRead(PIN_TRACKBALL_CLICK);
     uint32_t now = millis();
-    if (clicked) {
-        if (!click_since) {
-            click_since = now ? now : 1;
-            esc_sent = false;
-        } else if (!esc_sent && now - click_since >= 500) {
-            press_special(TDECK_KEY_ESC);
-            esc_sent = true;
-        }
-    } else if (click_since) {
-        if (!esc_sent)
+    if (!now) now = 1;
+    noInterrupts();
+    uint32_t isr_down_ms = tb_click_down_ms;
+    interrupts();
+    if (raw != click_down) {
+        if (!click_up_since)
+            click_up_since = now;
+        if (now - click_up_since < TRACKBALL_CLICK_DEBOUNCE_MS)
+            raw = click_down;
+        else
+            click_up_since = 0;
+    } else {
+        click_up_since = 0;
+    }
+    if (raw && !click_down) {
+        click_down = true;
+        click_since = isr_down_ms ? isr_down_ms : now;
+        if (now - click_since > 2000)
+            click_since = now;
+        esc_held = false;
+        boot_done = true;
+    } else if (!raw && click_down) {
+        click_down = false;
+        if (esc_held) {
+            int col; uint16_t mask;
+            if (tdeck_map_special(TDECK_KEY_ESC, &col, &mask))
+                release_key(col, mask);
+            esc_held = false;
+        } else if (click_since && now - click_since >= TRACKBALL_CLICK_DEBOUNCE_MS) {
             press_key(TDECK_ENTER_COL, TDECK_ENTER_MASK);
+        }
         click_since = 0;
+    }
+    if (click_down && !esc_held && click_since && now - click_since >= TRACKBALL_ESC_MS) {
+        int col; uint16_t mask;
+        if (tdeck_map_special(TDECK_KEY_ESC, &col, &mask)) {
+            hold_key(col, mask);
+            esc_held = true;
+            Serial.println("trackball Esc");
+        }
     }
 }
 
@@ -377,9 +488,9 @@ static void hal_keyboard_poll(void *ctx, uint16_t *matrix, int num_cols) {
 // Each frame writes 800 samples (16.7 ms) and waits for room, so the I2S
 // clock paces the emulator (see pace_frame). The queue is what absorbs a
 // run of slow frames (CyOS redrawing on every key press); its length is
-// also how far sound lags the screen. CYBIKO_AUDIO_BUFS x 400 samples.
+// also how far sound lags the screen. 8 x 400-sample DMA buffers ≈ 67 ms.
 #ifndef CYBIKO_AUDIO_BUFS
-#define CYBIKO_AUDIO_BUFS 18   // 150 ms: rapid screen changes gave 0 gaps
+#define CYBIKO_AUDIO_BUFS 8    // ~67 ms: 18 buffers made keys feel 150 ms late
 #endif
 #define I2S_DMA_BUF_COUNT CYBIKO_AUDIO_BUFS
 #define I2S_DMA_BUF_LEN   400
@@ -727,6 +838,173 @@ static cybiko_stats_t last_stats = {};
 #endif
 #define FPS_REPORT_INTERVAL_MS 5000
 
+/* T-Deck LiPo → CyOS 1.2.46 ADC ch1/ch2. USB is the charger path CyOS
+ * already idles on. Unplugged uses ch1 = ch2 = 341 + 36..38 (the only
+ * on-battery window that still idles). CyOS blinks the pack icon at
+ * level ≤ 42, so a healthy pack hides that icon by patching the two
+ * CMP.W #42 sites; around 10% the compare is restored.
+ *
+ * Charging is USB 5V, not a PC host. GPIO4 measures the +5V rail (Q4),
+ * so a wall brick reads ~4.6–5.0 V and a pack reads the cell. SOF still
+ * marks a host so unplug-from-PC is instant; a charger has no SOF.
+ *
+ * Do not use (bool)Serial: on a self-powered S3, unplugging the cable
+ * never raises BUS_RESET, so Serial stays true. SOF frames stop. */
+#define BAT_USB_MV_ON   4450
+#define BAT_USB_MV_OFF  4300
+/* 1S LiPo: 3.60 V is about 10%. Hysteresis so the icon does not chatter. */
+#define BAT_LOW_PCT_ON  10
+#define BAT_LOW_PCT_OFF 14
+static uint32_t bat_mv;
+static bool bat_usb;
+static bool bat_sof;
+static bool bat_low;
+static int bat_pct = 100;
+
+static uint16_t emu_peek16(uint32_t a) {
+    return ((uint16_t)cybiko_peek8(emu, a) << 8) | cybiko_peek8(emu, a + 1);
+}
+
+static uint32_t emu_peek32(uint32_t a) {
+    return ((uint32_t)emu_peek16(a) << 16) | emu_peek16(a + 2);
+}
+
+static void emu_poke16(uint32_t a, uint16_t v) {
+    cybiko_poke8(emu, a, (uint8_t)(v >> 8));
+    cybiko_poke8(emu, a + 1, (uint8_t)v);
+}
+
+static bool ram_ptr(uint32_t p, uint32_t need) {
+    return p >= 0x200000u && p + need < 0x280000u;
+}
+
+/* CyOS 1.2.46 smooths ADC 7/8 + 1/8. From charger to pack that takes
+ * ~30 s, so write the battery object when the cable state changes. */
+static void v1_sync_battery_ram(uint16_t ch1, uint16_t ch2) {
+#ifdef CYBIKO_MACHINE_V1
+    uint32_t obj = emu_peek32(0x227FD0u);
+    if (ram_ptr(obj, 0x20)) {
+        emu_poke16(obj + 0x1C, ch1);
+        emu_poke16(obj + 0x1E, ch2);
+    }
+    uint32_t tab = emu_peek32(0x227FCCu);
+    if (ram_ptr(tab, 0x0C)) {
+        emu_poke16(tab + 6, ch1);
+        emu_poke16(tab + 8, ch2);
+    }
+#else
+    (void)ch1;
+    (void)ch2;
+#endif
+}
+
+static bool usb_host_via_sof(void) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (USB_SERIAL_JTAG.int_raw.sof_int_raw) {
+        USB_SERIAL_JTAG.int_clr.val = (1u << 1);   /* SOF, write-1-to-clear */
+        return true;
+    }
+    return false;
+#else
+    return (bool)Serial;
+#endif
+}
+
+/* LiPo tops out ~4.2 V. USB 5V through the Schottky sits ~4.6–5.0 V. */
+static bool usb_5v_rail(uint32_t mv) {
+    if (mv >= BAT_USB_MV_ON)
+        return true;
+    if (mv < BAT_USB_MV_OFF)
+        return false;
+    return bat_usb;
+}
+
+static const char *bat_src_tag(void) {
+    if (bat_sof)
+        return "USB";
+    if (bat_usb)
+        return "chg";
+    if (bat_low)
+        return "low";
+    return "bat";
+}
+
+/* CyOS 1.2.46 only draws the blinking pack icon at level ≤ 42. That is
+ * also the only on-battery window that still idles, so a healthy pack
+ * cannot use a real level. Patch the two CMP.W #42 checks to 0 and the
+ * icon stays off; restore 42 when the T-Deck is around 10%. */
+static bool v1_set_lowbat_icon(bool show) {
+#ifdef CYBIKO_MACHINE_V1
+    static const uint32_t addrs[] = { 0x25B760u, 0x25B7CEu };
+    uint16_t lim = show ? 42 : 0;
+    int ok = 0;
+    for (unsigned i = 0; i < sizeof addrs / sizeof addrs[0]; i++) {
+        uint32_t a = addrs[i];
+        if (cybiko_peek8(emu, a) != 0x79 || cybiko_peek8(emu, a + 1) != 0x20)
+            continue;
+        emu_poke16(a + 2, lim);
+        ok++;
+    }
+    return ok == 2;
+#else
+    (void)show;
+    return true;
+#endif
+}
+
+static int lipo_pct(int mv) {
+    static const int pts[][2] = {
+        {3400, 0}, {3500, 5}, {3600, 10}, {3700, 20},
+        {3760, 30}, {3810, 40}, {3860, 50}, {3910, 60},
+        {3970, 70}, {4050, 80}, {4150, 100},
+    };
+    const int n = (int)(sizeof pts / sizeof pts[0]);
+    if (mv <= pts[0][0]) return pts[0][1];
+    if (mv >= pts[n - 1][0]) return pts[n - 1][1];
+    for (int i = 1; i < n; i++) {
+        if (mv <= pts[i][0]) {
+            int m0 = pts[i - 1][0], p0 = pts[i - 1][1];
+            int m1 = pts[i][0], p1 = pts[i][1];
+            return p0 + (mv - m0) * (p1 - p0) / (m1 - m0);
+        }
+    }
+    return 100;
+}
+
+static void tdeck_battery_apply(bool force_ram) {
+#ifdef CYBIKO_MACHINE_V1
+    if (!emu) return;
+    uint16_t ch1, ch2;
+    if (bat_usb) {
+        ch1 = 0x0300;
+        ch2 = 0x0100;
+        v1_set_lowbat_icon(false);
+    } else {
+        /* 36–39: CyOS still idles. 36 draws a shorter bar if the icon is on. */
+        int level = bat_low ? 36 : 38;
+        ch1 = ch2 = (uint16_t)(341 + level);
+        v1_set_lowbat_icon(bat_low);
+    }
+    cybiko_set_adc(emu, 1, ch1);
+    cybiko_set_adc(emu, 2, ch2);
+    if (force_ram)
+        v1_sync_battery_ram(ch1, ch2);
+#endif
+}
+
+static void tdeck_battery_poll(void) {
+    uint32_t sum = 0;
+    for (int i = 0; i < 4; i++)
+        sum += analogReadMilliVolts(PIN_BAT_ADC);
+    bat_mv = (sum / 4) * (uint32_t)BAT_ADC_DIV;
+    bat_pct = lipo_pct((int)bat_mv);
+    if (bat_pct <= BAT_LOW_PCT_ON)
+        bat_low = true;
+    else if (bat_pct >= BAT_LOW_PCT_OFF)
+        bat_low = false;
+    tdeck_battery_apply(false);
+}
+
 #ifdef CYBIKO_DIAG_SPI
 // Shared-bus check: an SD write and an SX1262 status read, run before and
 // after TFT_eSPI takes the SPI host for DMA.
@@ -768,6 +1046,8 @@ void setup() {
     // Enable peripheral power
     pinMode(PIN_POWER_ON, OUTPUT);
     digitalWrite(PIN_POWER_ON, HIGH);
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_BAT_ADC, ADC_11db);
 
     // Deselect all SPI devices
     pinMode(PIN_TFT_CS, OUTPUT);
@@ -784,9 +1064,11 @@ void setup() {
     // Init SPI bus
     SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
-    // Init I2C with keyboard startup delay
+    // Init I2C with keyboard startup delay. Keep the default 100 kHz: 800 kHz
+    // timed out (error 263) on this C3 keyboard and dropped the loop to ~1 fps.
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     delay(500);
+    Wire.setTimeOut(50);
 
     // Init TFT
     tft.init();
@@ -1031,6 +1313,7 @@ void setup() {
     }
 #endif
 
+    tdeck_battery_poll();
     cybiko_reset(emu);
 
     // Init DMA after SD card operations are complete (shared SPI bus)
@@ -1051,8 +1334,8 @@ void setup() {
     last_nvram_save_ms = millis();
     last_fps_report = millis();
     emu_started_ms = millis();
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("Loading CyOS can take a few minutes", 4, 2, 2);
+    snprintf(chrome_top, sizeof chrome_top, "Loading CyOS...");
+    draw_chrome();
     Serial.println("Cybiko emulator started");
 }
 
@@ -1116,9 +1399,10 @@ static void report_pc_samples(void) {
 #endif
 
 void loop() {
-    // Poll input
+    // Poll input. Tick after the guest has seen this frame's keys: ticking
+    // first cut every synthetic hold by a frame, and Esc never lasted long
+    // enough for CyOS to scan it.
     poll_input();
-    keyboard_tick_frame();
 
     uint32_t t0 = micros();
     audio_wait_us = 0;
@@ -1126,9 +1410,24 @@ void loop() {
     // Time blocked on the audio queue is pacing, not emulation
     frame_us += micros() - t0 - audio_wait_us;
     pace_wait_us += audio_wait_us;
+    keyboard_tick_frame();
     count_i2s_underruns();
 
     cybiko_sx1262_pump();
+    {
+        bool sof = usb_host_via_sof();
+        if (sof != bat_sof || (frame_count % 60) == 0) {
+            tdeck_battery_poll();
+            bool usb = sof || usb_5v_rail(bat_mv);
+            bool changed = (usb != bat_usb) || (sof != bat_sof);
+            bat_sof = sof;
+            bat_usb = usb;
+            if (changed)
+                tdeck_battery_apply(true);
+        } else {
+            v1_set_lowbat_icon(!bat_usb && bat_low);
+        }
+    }
     if (!boot_done) {
         cybiko_stats_t bst;
         cybiko_get_stats(emu, &bst);
@@ -1159,12 +1458,14 @@ void loop() {
             ((float)frames * CYBIKO_CYCLES_PER_FRAME) : 0.0f;
         Serial.printf("%.1f fps (%.0f%%)  %.0f kIPS  %.0f cyc/insn  "
                       "sleep %.0f%%  core %lu ms  render %lu ms  idle %lu ms  "
-                      "audio gaps %lu\n",
+                      "audio gaps %lu  bat %lu mV %s %d%%\n",
                       fps, speed_pct, kips, cyc_per_insn, sleep_pct,
                       (unsigned long)(cpu_us / 1000),
                       (unsigned long)(render_us / 1000),
                       (unsigned long)(pace_wait_us / 1000),
-                      (unsigned long)i2s_underruns);
+                      (unsigned long)i2s_underruns,
+                      (unsigned long)bat_mv, bat_src_tag(),
+                      bat_pct);
         i2s_underruns = 0;
         pace_wait_us = 0;
 #ifdef CYBIKO_SPLIT_PROFILE
@@ -1194,12 +1495,14 @@ void loop() {
 #endif
         if (const cybiko_lora_t *lk = cybiko_sx1262_link()) {
             const cybiko_sx1262_stats_t *rs = cybiko_sx1262_phy_stats();
-            Serial.printf("  radio rx %lu (crc %lu, link bad %lu, msgs %lu) "
-                          "tx %lu done %lu rejected %lu  rssi %d snr %d  bus waits %lu\n",
+            Serial.printf("  radio rx %lu (crc %lu, link bad %lu, msgs %lu held %lu) "
+                          "tx %lu done %lu rejected %lu held %lu  rssi %d snr %d  bus waits %lu\n",
                           (unsigned long)rs->rx_ok, (unsigned long)rs->rx_crc,
                           (unsigned long)lk->stats.rx_bad, (unsigned long)lk->stats.rx_msgs,
+                          (unsigned long)lk->stats.rx_held,
                           (unsigned long)lk->stats.tx_pkts, (unsigned long)rs->tx_done,
                           (unsigned long)lk->stats.tx_rejected,
+                          (unsigned long)lk->stats.tx_held,
                           rs->last_rssi_dbm, rs->last_snr_db,
                           (unsigned long)rs->bus_waits);
         }
@@ -1209,13 +1512,9 @@ void loop() {
         last_stats = st;
         frame_us = 0;
         render_us = 0;
-        char bar[40];
-        snprintf(bar, sizeof bar, "%.0f fps  %s", fps,
-                 boot_unpacking() ? "unpacking..." : "running");
-        tft.dmaWait();  // do not mix register writes with a DMA in flight
-        tft.fillRect(0, 0, SCALED_W, BORDER_TOP, TFT_BLACK);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawString(bar, 4, 2, 2);
+        snprintf(chrome_top, sizeof chrome_top, "%.0f fps  %.2fV %s %d%%",
+                 fps, bat_mv / 1000.0f, bat_src_tag(), bat_pct);
+        draw_chrome();
         frame_count = 0;
         last_fps_report = now;
     }

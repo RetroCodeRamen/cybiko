@@ -3,7 +3,7 @@
 
 /*
  * PHY over a USB serial LoRa modem (cybiko-heltec-modem, modem_proto.h).
- * POSIX only: the Linux emulator and host tools.
+ * Linux and Windows USB serial.
  *
  * tx() writes one 'T' frame and reports busy until the modem answers 'D',
  * so radio_lora paces itself on real airtime. poll() reads whatever the
@@ -13,6 +13,7 @@
 #include "radio_phy.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,7 +30,7 @@ typedef struct {
 
 typedef struct {
     cybiko_radio_phy_t phy;
-    int fd;
+    intptr_t fd;  /* POSIX fd, or Win32 HANDLE */
     int tx_busy;
     uint64_t tx_started_ms;
     void *dec;   /* slip_decoder_t, kept out of this header */

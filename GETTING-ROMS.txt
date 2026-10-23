@@ -1,0 +1,15 @@
+Cybiko ROM images are not included in this project.
+
+You need to provide your own Classic (V1) dumps:
+
+  boot.bin   Cybiko boot ROM, 32 KB (often named cyrom112.bin)
+  flash.bin  CyOS 1.2.46 flash image (often named flash_v1246.bin)
+
+Place them next to the emulator as roms/boot.bin and roms/flash.bin,
+or pass the paths on the command line.
+
+Dumps are often archived on the Internet Archive:
+
+  https://archive.org/details/cybiko
+
+This project does not host CyOS or boot ROMs.

@@ -656,17 +656,26 @@ static void write_on_chip8(address_bus_t *bus, uint32_t address, uint8_t value)
             channel = 0; reg = address - 0xFFFF78;
         }
         /* TDR - Transmit Data Register (reg offset 3). On V1, SCI1 is
-         * the SPI flash link, not a console: its bytes are not echoed. */
-        if (reg == 3 && !(CYBIKO_HAS_SPI_FLASH && channel == 1)) {
-            char c = (char)(value & 0x7F);
-            if (c >= 0x20 || c == '\n') {
-                /* printable or newline */
-            } else {
-                c = '.';
-            }
-            if (bus->sci_output_pos[channel] < 255) {
-                bus->sci_output[channel][bus->sci_output_pos[channel]++] = c;
-                bus->sci_output[channel][bus->sci_output_pos[channel]] = '\0';
+         * the SPI flash link and SCI0 is the radio UART once bound;
+         * neither is a console. Dumping radio frames to USB CDC made
+         * every key wait on the host draining the port. */
+        if (reg == 3) {
+            bool echo = true;
+#if CYBIKO_HAS_SPI_FLASH
+            if (channel == 1 || (channel == 0 && bus->sci0.bound))
+                echo = false;
+#endif
+            if (echo) {
+                char c = (char)(value & 0x7F);
+                if (c >= 0x20 || c == '\n') {
+                    /* printable or newline */
+                } else {
+                    c = '.';
+                }
+                if (bus->sci_output_pos[channel] < 255) {
+                    bus->sci_output[channel][bus->sci_output_pos[channel]++] = c;
+                    bus->sci_output[channel][bus->sci_output_pos[channel]] = '\0';
+                }
             }
         }
         if (channel == 2 && bus->sci2.bound)

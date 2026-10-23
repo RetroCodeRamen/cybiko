@@ -288,6 +288,25 @@ void cybiko_run_frame(cybiko_emu_t *emu) {
         emu->prev_keys[i] = emu->keyboard.columns[i];
     }
 #endif
+#if CYBIKO_HAS_SPI_FLASH
+    if (emu->bus.sci0.bound) {
+        bool keys = false;
+        for (int i = 0; i < CYBIKO_KEYBOARD_SCAN_COLS; i++) {
+            if (emu->keyboard.columns[i]) {
+                keys = true;
+                break;
+            }
+        }
+        /* Pulse keys last 3–4 frames. Keep radio quiet a little after so
+         * a 1 Hz poll cannot land between letters and eat the next scan. */
+        static int quiet;
+        if (keys)
+            quiet = 12;
+        else if (quiet > 0)
+            quiet--;
+        emu->bus.sci0.input_busy = keys || quiet > 0;
+    }
+#endif
 
     /* Begin speaker frame (record start level, reset transitions) */
     speaker_begin_frame(&emu->speaker);

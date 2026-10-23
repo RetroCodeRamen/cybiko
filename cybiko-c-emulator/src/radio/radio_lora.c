@@ -21,12 +21,26 @@ static void lora_set_listener(cybiko_radio_transport_t *self,
     t->fn_user = user;
 }
 
+/* Guest payload after the 8-byte RF header is stripped: byte 0 is
+ * 0xC0|channel, byte 1 is the frame type (0x01 = presence beacon),
+ * bytes 12-19 are the nickname. Sequence/CRC bytes still change. */
+static bool lora_is_beacon(const uint8_t *data, size_t len) {
+    return data && len >= 20 && len <= 50 && data[1] == 0x01;
+}
+
 static int lora_send(cybiko_radio_transport_t *self,
                      const uint8_t *data, size_t len, uint8_t channel) {
     cybiko_lora_t *t = self->impl;
     if (!t->tx_enabled) {
         t->stats.tx_rejected++;
         return -1;
+    }
+    if (lora_is_beacon(data, len) && t->last_beacon_set &&
+        data[0] == t->last_beacon_ch &&
+        memcmp(data + 12, t->last_beacon_name, 8) == 0 &&
+        t->pumps - t->last_beacon_pump < CYBIKO_LORA_BEACON_HOLD_PUMPS) {
+        t->stats.tx_held++;
+        return 0;   /* CyOS already transmitted; keep it off the air */
     }
     uint8_t pkts[CYBIKO_LINK_MAX_FRAGS][CYBIKO_LINK_MAX_PHYS];
     uint16_t lens[CYBIKO_LINK_MAX_FRAGS];
@@ -46,12 +60,19 @@ static int lora_send(cybiko_radio_transport_t *self,
         t->txq_count++;
     }
     t->stats.tx_msgs++;
+    if (lora_is_beacon(data, len)) {
+        t->last_beacon_set = true;
+        t->last_beacon_ch = data[0];
+        memcpy(t->last_beacon_name, data + 12, 8);
+        t->last_beacon_pump = t->pumps;
+    }
     return 0;
 }
 
 static void lora_pump(cybiko_radio_transport_t *self) {
     cybiko_lora_t *t = self->impl;
     cybiko_radio_phy_t *phy = t->phy;
+    t->pumps++;
     if (phy->poll)
         phy->poll(phy);
 
@@ -68,7 +89,20 @@ static void lora_pump(cybiko_radio_transport_t *self) {
         if (rc < 0) {
             t->stats.rx_bad++;
         } else if (rc == 1) {
+            if (lora_is_beacon(out, out_len) && t->last_rx_beacon_set &&
+                sender == t->last_rx_beacon_from &&
+                memcmp(out + 12, t->last_rx_beacon_name, 8) == 0 &&
+                t->pumps - t->last_rx_beacon_pump < CYBIKO_LORA_BEACON_HOLD_PUMPS) {
+                t->stats.rx_held++;
+                continue;
+            }
             t->stats.rx_msgs++;
+            if (lora_is_beacon(out, out_len)) {
+                t->last_rx_beacon_set = true;
+                t->last_rx_beacon_from = sender;
+                memcpy(t->last_rx_beacon_name, out + 12, 8);
+                t->last_rx_beacon_pump = t->pumps;
+            }
             if (t->fn)
                 t->fn(t->fn_user, out, out_len, channel, sender);
         }

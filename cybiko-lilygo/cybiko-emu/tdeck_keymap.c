@@ -43,6 +43,8 @@ static const tdeck_ascii_key_t ASCII_MAP[] = {
     { '9', 8, 0x04, false, 0, 0 }, { 'p', 8, 0x08, false, 0, 0 },
     { 'o', 8, 0x10, false, 0, 0 }, { 'l', 8, 0x20, false, 0, 0 },
     { ',', 8, 0x40, false, 0, 0 },
+    /* T-Deck $ then $ → CyOS Shift+4 */
+    { '$', 3, 0x08, false, 0, 0 },
 };
 #else
 static const tdeck_ascii_key_t ASCII_MAP[] = {
@@ -110,7 +112,7 @@ bool tdeck_map_ascii(char c, tdeck_key_event_t *ev) {
     }
     if (!ev) return true;
     ev->found = true;
-    ev->needs_shift = upper && !k->needs_fn;
+    ev->needs_shift = (upper && !k->needs_fn) || k->ascii == '$';
     ev->needs_fn = k->needs_fn;
     ev->col = k->col;
     ev->mask = k->mask;

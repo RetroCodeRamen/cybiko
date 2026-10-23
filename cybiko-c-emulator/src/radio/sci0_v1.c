@@ -24,12 +24,13 @@
 #define ASYNC_INTERVAL       512
 #define BOOTSTRAP_INITIAL    2000000
 #define BOOTSTRAP_RETRY      500000
-/* Java polls every 15 frames. Each poll also sends a beacon, and every
- * reply is run through the boot ROM's error correction (~650 guest
- * instructions a byte): at 15 the Classic never idled at stride 12, and a
- * 4 Hz beacon would fill a LoRa channel by itself. */
+/* Java polls every 15 frames. Each poll also sends a beacon, and CyOS
+ * Reed-Solomon-encodes it even when radio_lora later holds the TX. At 15
+ * the Classic never idled at stride 12; at 60 (1 Hz) typing still starved
+ * because a poll used the whole guest frame. 180 is 3 s, inside the 5 s
+ * LoRa beacon hold, so Nearby still updates and the UI can scan keys. */
 #ifndef CYBIKO_V1_POLL_FRAMES
-#define CYBIKO_V1_POLL_FRAMES 60
+#define CYBIKO_V1_POLL_FRAMES 180
 #endif
 #define POLL_INTERVAL_FRAMES CYBIKO_V1_POLL_FRAMES
 
@@ -161,6 +162,8 @@ static void sci0_bootstrap(cybiko_sci0_v1_t *s, int cycles) {
 }
 
 static void sci0_async_delivery(cybiko_sci0_v1_t *s) {
+    if (s->input_busy)
+        return;
     if (!s->bootstrapped || s->rdrf || cybiko_radio_coproc_rx_count(s->coproc) > 0 ||
         cybiko_radio_coproc_pending(s->coproc) <= 0)
         return;
@@ -192,7 +195,8 @@ void cybiko_sci0_advance(cybiko_sci0_v1_t *s, int cycles) {
                 sci0_raise_irq(s, CYBIKO_SCI0_TXI_VECTOR);
         }
     }
-    if (!s->rdrf && cybiko_radio_coproc_rx_count(s->coproc) > 0) {
+    if (!s->input_busy && !s->rdrf &&
+        cybiko_radio_coproc_rx_count(s->coproc) > 0) {
         s->rdr = (uint8_t)cybiko_radio_coproc_read(s->coproc);
         s->rdrf = true;
         if (s->scr & 0x40)
@@ -211,6 +215,10 @@ void cybiko_sci0_frame(cybiko_sci0_v1_t *s) {
         return;
     if (++s->poll_frames < POLL_INTERVAL_FRAMES)
         return;
+    if (s->input_busy) {
+        s->poll_frames = POLL_INTERVAL_FRAMES - 1;
+        return;
+    }
     s->poll_frames = 0;
 
     uint32_t obj = sci0_radio_obj(s);

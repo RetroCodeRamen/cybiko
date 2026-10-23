@@ -1,12 +1,30 @@
-# Cybiko on the LilyGO T-Deck
+# Cybiko
 
-Native Cybiko Xtreme emulator for the original LilyGO T-Deck, with LoRa as a transport under the emulated Cybiko radio. The guest is original CyOS. This is not a Cybiko-style rewrite.
+**v1.1026.1b (beta)** — October 2026. Ready for testers. Not a finished 1.0.
 
-The design and the reasons for it are in [ARCHITECTURE.md](ARCHITECTURE.md). The work order is in [PLAN.md](PLAN.md).
+Native Cybiko Classic (V1) on a PC and on the LilyGO T-Deck, with a Heltec WiFi LoRa 32 V3 as the PC radio. The guest is original CyOS. This is not a Cybiko-style rewrite.
+
+GitHub Releases has Linux and Windows builds of the PC emulator. You must supply your own ROM images; see [GETTING-ROMS.txt](GETTING-ROMS.txt). Dumps are often on the Internet Archive: <https://archive.org/details/cybiko>
+
+The design is in [ARCHITECTURE.md](ARCHITECTURE.md). The work order is in [PLAN.md](PLAN.md) and [PLAN-V1.md](PLAN-V1.md).
+
+## PC emulator (Classic)
+
+```bash
+# Linux (SDL2, libpng, X11)
+cybiko-lilygo/tools/v1_emu.sh roms/cyrom112.bin roms/flash_v1246.bin
+
+# Windows (MinGW): tools\v1_emu.bat, or the release zip
+v1_emu.exe roms\cyrom112.bin roms\flash_v1246.bin --shell img\cybiko.png
+```
+
+Omit `--radio` and the emulator attaches the first Heltec CP2102 (`10c4:ea60`). Right-click the device for Settings: shell color, 4× LCD zoom, Always on top, and flash buttons for the Heltec radio firmware and the T-Deck Classic firmware (needs PlatformIO and this source tree).
 
 ## Current status
 
-Checked on this machine on 22 Oct 2026.
+Beta snapshot, 23 Oct 2026. PC Classic shell, Heltec LoRa, T-Deck Classic firmware, and a Windows `.exe` (tested under Wine) are in this tree. Still open: a one-click end-user flash pack without PlatformIO, the CyOS app loader, XT battery on Port A, and native Windows click-through window shaping.
+
+Checked on this machine on 22–23 Oct 2026.
 
 - `make -C cybiko-c-emulator test` passed. That includes the CPU and peripherals, the radio codec, the SCI2 beacon crossing two guest buffers, the CyID patch, and a 400-byte `.app` written into the filesystem and read back.
 - XT ROMs are on this machine as `roms/cyrom150.bin` (32 KB) and `roms/cyos_v1508.bin` (512 KB). They are not part of the tree.

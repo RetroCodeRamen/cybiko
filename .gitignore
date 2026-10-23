@@ -1,7 +1,9 @@
-# CyOS dumps and device saves stay on the card, not in git.
+# CyOS dumps, device saves, and the local app library stay off git.
 roms/
+Apps/
 cybikov1.zip
 *.bin
+*.app
 *.nvram
 *.flash
 save.tmp
@@ -14,6 +16,8 @@ cybiko-java-emulator-main/
 
 # Build and IDE
 .pio/
+*.exe
+*.dll
 build/
 build-sdl/
 .gradle/

@@ -2,6 +2,9 @@
 
 // --- Power ---
 #define PIN_POWER_ON        10
+/* Original T-Deck: LiPo through a 1:1 (100k/100k) divider. */
+#define PIN_BAT_ADC         4
+#define BAT_ADC_DIV         2
 
 // --- SPI Bus ---
 #define PIN_SPI_MOSI        41
@@ -52,3 +55,4 @@
 #define SCALED_W            320
 #define SCALED_H            200
 #define BORDER_TOP          20
+#define BORDER_BOTTOM       (BORDER_TOP + SCALED_H)
