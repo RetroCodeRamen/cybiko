@@ -79,10 +79,18 @@ static void pop_frame(cybiko_radio_coproc_t *c) {
     c->q_count--;
 }
 
+/* A real RF2915 hears only the channel it is tuned to. Each Chat room is
+ * its own channel (MAIN 4, Romantic 6, Computers 8, Sports 10, Games 52,
+ * Music 54; the desktop is 2), so without this a room shows messages
+ * posted in another. Until CyOS tunes, everything is let through. */
 static void on_packet(void *user, const uint8_t *data, size_t len,
                       uint8_t channel, uint32_t sender_id) {
-    (void)channel;
-    queue_frame((cybiko_radio_coproc_t *)user, data, len, sender_id);
+    cybiko_radio_coproc_t *c = (cybiko_radio_coproc_t *)user;
+    if (c->channel_set && channel != c->current_channel) {
+        c->stat_off_channel++;
+        return;
+    }
+    queue_frame(c, data, len, sender_id);
 }
 
 void cybiko_radio_coproc_set_transport(cybiko_radio_coproc_t *c, cybiko_radio_transport_t *t) {
@@ -232,6 +240,7 @@ static void process_command3(cybiko_radio_coproc_t *c, uint8_t cmd, uint8_t para
         break;
     case 0x02:
         c->current_channel = param;
+        c->channel_set = true;
         if (c->transport && c->transport->set_channel)
             c->transport->set_channel(c->transport, param);
         rxq_push(c, CYBIKO_RADIO_ACK);

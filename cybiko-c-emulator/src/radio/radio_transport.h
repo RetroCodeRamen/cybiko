@@ -13,8 +13,8 @@
  * send_packet must not block the CPU emulator. The host calls pump() from
  * a radio task or the test harness.
  *
- * Channel is recorded, not filtered. CyOS hops between channels 2 and 4
- * while a packet may still be in flight.
+ * Every packet carries its channel. The transport does not filter on it;
+ * the co-processor drops packets for a channel CyOS is not tuned to.
  */
 
 #include <stddef.h>

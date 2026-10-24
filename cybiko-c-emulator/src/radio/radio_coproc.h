@@ -58,6 +58,7 @@ typedef struct cybiko_radio_coproc {
     bool rx_frame_ready;
     bool async_rx_pending;
     uint8_t current_channel;
+    bool channel_set;            /* CyOS has tuned; frames on other channels are dropped */
     cybiko_radio_cmd_t last_command;
 
     uint8_t cmd[3];
@@ -82,6 +83,7 @@ typedef struct cybiko_radio_coproc {
     uint32_t stat_tx_drop;
     uint32_t stat_rx;
     uint32_t stat_overflow;
+    uint32_t stat_off_channel;
     uint16_t last_tx_len;
     uint8_t  last_tx[24];
 } cybiko_radio_coproc_t;

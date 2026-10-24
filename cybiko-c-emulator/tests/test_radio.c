@@ -68,6 +68,30 @@ static void test_channel_command_and_short_drop(void) {
     TEST_CHECK(cpu[0].stat_tx == 0);
 }
 
+static void test_tuned_channel_only(void) {
+    setup_n(2, 255);
+    uint8_t payload[192], raw[210];
+    chat(payload, "main");
+    size_t n = wrap_xt(raw, 0x10000001u, payload, 192);
+    cybiko_radio_coproc_handle_transmit(&cpu[0], raw, n);
+    radio_sim_bus_pump(&bus);
+    TEST_CHECK(cybiko_radio_coproc_pending(&cpu[1]) == 1);   /* not tuned yet */
+
+    cybiko_radio_coproc_receive(&cpu[1], 0x01);
+    cybiko_radio_coproc_receive(&cpu[1], 0x02);
+    cybiko_radio_coproc_receive(&cpu[1], 0x08);               /* Computers */
+    cybiko_radio_coproc_handle_transmit(&cpu[0], raw, n);     /* MAIN, ch 4 */
+    radio_sim_bus_pump(&bus);
+    TEST_CHECK(cybiko_radio_coproc_pending(&cpu[1]) == 1);
+    TEST_CHECK(cpu[1].stat_off_channel == 1);
+
+    payload[0] = 0xC8;
+    n = wrap_xt(raw, 0x10000001u, payload, 192);
+    cybiko_radio_coproc_handle_transmit(&cpu[0], raw, n);
+    radio_sim_bus_pump(&bus);
+    TEST_CHECK(cybiko_radio_coproc_pending(&cpu[1]) == 2);
+}
+
 static void test_beacon_and_chat_roundtrip(void) {
     setup_n(2, 64); /* forces the 192-byte chat across several PHY packets */
     uint8_t payload[192];
@@ -271,6 +295,7 @@ static void test_v2_beacon_uses_small_indicator(void) {
 TEST_LIST = {
     { "link self-check", test_self_check },
     { "channel command and short frame drop", test_channel_command_and_short_drop },
+    { "only the tuned channel is heard", test_tuned_channel_only },
     { "beacon and chat across a small MTU", test_beacon_and_chat_roundtrip },
     { "opaque type, null read, queue cap", test_opaque_type_and_null_and_cap },
     { "loss, duplicate, latency, three peers", test_loss_dup_latency_peers },
