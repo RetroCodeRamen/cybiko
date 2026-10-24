@@ -12,6 +12,8 @@ bool cybiko_load_boot_rom(cybiko_emu_t *emu, const uint8_t *data, size_t len);
 bool cybiko_load_flash_rom(cybiko_emu_t *emu, const uint8_t *data, size_t len);
 bool cybiko_load_nvram(cybiko_emu_t *emu, const uint8_t *data, size_t len);
 void cybiko_reset(cybiko_emu_t *emu);
+/* Cold boot: RAM and peripherals, CPU reset. Flash / NVRAM image stay. */
+void cybiko_reboot(cybiko_emu_t *emu);
 void cybiko_run_frame(cybiko_emu_t *emu);
 struct cybiko_radio_coproc;
 void cybiko_attach_radio(cybiko_emu_t *emu, struct cybiko_radio_coproc *coproc);

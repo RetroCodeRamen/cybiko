@@ -63,7 +63,7 @@
 #define MENU_W 168
 #define MENU_ROW 28
 #define SETTINGS_W 420
-#define SETTINGS_H 430
+#define SETTINGS_H 490
 #define ABOUT_W 440
 #define ABOUT_H 490
 #define STATUS_W 440
@@ -120,7 +120,9 @@ typedef struct {
     int overlay_front;
     cybiko_emu_t *emu;
     cybiko_lora_t *lora;
+    cybiko_radio_coproc_t *coproc;
     uint32_t radio_cyid;
+    bool powered;
     bool always_on_top;
     bool mute;
     int scale_pct;
@@ -278,6 +280,7 @@ static void drop_held(sdl_ctx_t *s, int i);
 static void press_hold(sdl_ctx_t *s, int col, uint16_t mask, bool down);
 static const shell_hit_t *hit_at(int x, int y);
 static void win_to_img(const sdl_ctx_t *s, int wx, int wy, int *ix, int *iy);
+static void present(sdl_ctx_t *s);
 
 static int file_ok(const char *p) {
     FILE *f = fopen(p, "rb");
@@ -1056,8 +1059,10 @@ static void draw_swatch(SDL_Renderer *ren, int x, int y, int on,
 #define FLASH_BTN_X 24
 #define FLASH_BTN_W 148
 #define FLASH_BTN_H 28
-#define FLASH_HELTEC_Y 276
-#define FLASH_TDECK_Y 314
+#define DEVICE_BTN_Y 276
+#define POWER_BTN_X 188
+#define FLASH_HELTEC_Y 336
+#define FLASH_TDECK_Y 374
 
 static void draw_flash_btn(SDL_Renderer *ren, int x, int y,
                            int busy, int found,
@@ -1162,7 +1167,12 @@ static void draw_settings(sdl_ctx_t *s) {
               s->view == VIEW_BODY ? "[x] Body" : "[ ] Body");
     draw_text(s->settings_ren, 180, 220, 2, 230, 240, 255,
               s->view == VIEW_CLOSEUP ? "[x] 4x zoom" : "[ ] 4x zoom");
-    draw_text(s->settings_ren, 24, 256, 2, ar, ag, ab, "Flash");
+    draw_text(s->settings_ren, 24, 256, 2, ar, ag, ab, "Device");
+    draw_flash_btn(s->settings_ren, FLASH_BTN_X, DEVICE_BTN_Y, 0, 1,
+                   ar, ag, ab, "Reboot", NULL);
+    draw_flash_btn(s->settings_ren, POWER_BTN_X, DEVICE_BTN_Y, 0, 1,
+                   ar, ag, ab, s->powered ? "Power off" : "Power on", NULL);
+    draw_text(s->settings_ren, 24, 316, 2, ar, ag, ab, "Flash");
     {
         char hs[28] = "not found", ts[28] = "not found";
         int hbusy = s->flash_state == FLASH_BUSY && s->flash_target == FLASH_HELTEC;
@@ -1183,9 +1193,9 @@ static void draw_settings(sdl_ctx_t *s) {
         if (s->flash_state == FLASH_ERR) { r = 255; g = 90; b = 90; }
         else if (s->flash_state == FLASH_OK) { r = 90; g = 220; b = 130; }
         else if (s->flash_state == FLASH_BUSY) { r = ar; g = ag; b = ab; }
-        draw_text(s->settings_ren, 24, 354, 1, r, g, b, s->flash_msg);
+        draw_text(s->settings_ren, 24, 414, 1, r, g, b, s->flash_msg);
     }
-    draw_text(s->settings_ren, 24, 392, 2, ar, ag, ab, "[ Done ]");
+    draw_text(s->settings_ren, 24, 452, 2, ar, ag, ab, "[ Done ]");
     SDL_RenderPresent(s->settings_ren);
 }
 
@@ -1217,6 +1227,54 @@ static void open_settings(sdl_ctx_t *s) {
     draw_settings(s);
 }
 
+static void drop_all_keys(sdl_ctx_t *s) {
+    memset(s->key_matrix, 0, sizeof s->key_matrix);
+    s->held_count = 0;
+    s->mouse_col = -1;
+    s->mouse_mask = 0;
+}
+
+static void blank_lcd(sdl_ctx_t *s) {
+    uint32_t *tex;
+    int pitch;
+    if (!s->texture) return;
+    if (SDL_LockTexture(s->texture, NULL, (void **)&tex, &pitch) != 0)
+        return;
+    for (int i = 0; i < CYBIKO_LCD_WIDTH * CYBIKO_LCD_HEIGHT; i++)
+        tex[i] = 0xFF000000u;
+    SDL_UnlockTexture(s->texture);
+    present(s);
+}
+
+static void guest_reboot(sdl_ctx_t *s) {
+    drop_all_keys(s);
+    if (s->emu)
+        cybiko_reboot(s->emu);
+    if (s->coproc) {
+        cybiko_radio_coproc_init(s->coproc);
+        if (s->lora)
+            cybiko_radio_coproc_set_transport(s->coproc, &s->lora->base);
+        if (s->emu)
+            cybiko_attach_radio_id(s->emu, s->coproc, s->radio_cyid);
+    }
+    if (s->lora)
+        cybiko_lora_seed_msg_id(s->lora, (uint32_t)SDL_GetPerformanceCounter());
+    s->powered = true;
+    if (s->audio)
+        SDL_PauseAudioDevice(s->audio, s->mute ? 1 : 0);
+    fprintf(stderr, "guest reboot\n");
+}
+
+static void guest_power_off(sdl_ctx_t *s) {
+    if (!s->powered) return;
+    s->powered = false;
+    drop_all_keys(s);
+    blank_lcd(s);
+    if (s->audio)
+        SDL_PauseAudioDevice(s->audio, 1);
+    fprintf(stderr, "guest power off\n");
+}
+
 static void settings_click(sdl_ctx_t *s, int x, int y) {
     if (y >= 48 && y < 80) {
         s->always_on_top = !s->always_on_top;
@@ -1224,7 +1282,8 @@ static void settings_click(sdl_ctx_t *s, int x, int y) {
         save_prefs(s);
     } else if (y >= 80 && y < 112) {
         s->mute = !s->mute;
-        if (s->audio) SDL_PauseAudioDevice(s->audio, s->mute ? 1 : 0);
+        if (s->audio)
+            SDL_PauseAudioDevice(s->audio, (s->mute || !s->powered) ? 1 : 0);
         save_prefs(s);
     } else if (y >= 112 && y < 144) {
         if (x < 140 && s->scale_pct > 50) {
@@ -1253,13 +1312,22 @@ static void settings_click(sdl_ctx_t *s, int x, int y) {
             apply_scale(s);
             save_prefs(s);
         }
+    } else if (y >= DEVICE_BTN_Y && y < DEVICE_BTN_Y + FLASH_BTN_H) {
+        if (x >= FLASH_BTN_X && x < FLASH_BTN_X + FLASH_BTN_W)
+            guest_reboot(s);
+        else if (x >= POWER_BTN_X && x < POWER_BTN_X + FLASH_BTN_W) {
+            if (s->powered)
+                guest_power_off(s);
+            else
+                guest_reboot(s);
+        }
     } else if (x >= FLASH_BTN_X && x < FLASH_BTN_X + FLASH_BTN_W
                && y >= FLASH_HELTEC_Y && y < FLASH_HELTEC_Y + FLASH_BTN_H) {
         start_flash(s, FLASH_HELTEC);
     } else if (x >= FLASH_BTN_X && x < FLASH_BTN_X + FLASH_BTN_W
                && y >= FLASH_TDECK_Y && y < FLASH_TDECK_Y + FLASH_BTN_H) {
         start_flash(s, FLASH_TDECK);
-    } else if (y >= 384) {
+    } else if (y >= 444) {
         close_settings(s);
         return;
     }
@@ -1292,6 +1360,7 @@ static const about_line_t ABOUT[] = {
     { " Enter opens. Esc backs out.", 0 },
     { " Ctrl+Q quits. Drag the body", 0 },
     { " to move the window.", 0 },
+    { " Settings: Reboot or Power.", 0 },
     { "", 0 },
     { "T-Deck", 1 },
     { " The keyboard is the Cybiko.", 0 },
@@ -1927,6 +1996,7 @@ int main(int argc, char **argv) {
     sdl_ctx_t sdl;
     memset(&sdl, 0, sizeof sdl);
     sdl.mouse_col = -1;
+    sdl.powered = true;
     load_prefs(&sdl);
     sdl.app_icon = load_app_icon();
     if (sdl.app_icon)
@@ -2083,6 +2153,7 @@ int main(int argc, char **argv) {
             cybiko_lora_init(&link, &phy.phy, cyid, true);
             cybiko_lora_seed_msg_id(&link, (uint32_t)SDL_GetPerformanceCounter());
             sdl.lora = &link;
+            sdl.coproc = &cop;
             cybiko_radio_coproc_init(&cop);
             cybiko_radio_coproc_set_transport(&cop, &link.base);
             cybiko_attach_radio_id(emu, &cop, cyid);
@@ -2103,8 +2174,10 @@ int main(int argc, char **argv) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev))
             on_event(&sdl, &ev, &running);
-        cybiko_run_frame(emu);
-        tick_keys(&sdl);
+        if (sdl.powered) {
+            cybiko_run_frame(emu);
+            tick_keys(&sdl);
+        }
         if (sdl.radio_on) {
             link.base.pump(&link.base);
             if ((int32_t)(SDL_GetTicks() - radio_at) >= 0) {

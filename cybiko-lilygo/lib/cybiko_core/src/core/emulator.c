@@ -71,6 +71,27 @@ static void timer16_ch1_tiocb_cb(void *ctx, int level) {
     speaker_set_level(&emu->speaker, level);
 }
 
+static void init_peripherals(cybiko_emu_t *emu) {
+    hd66421_init(&emu->lcd);
+
+    timer8_init(&emu->timer8[0], 0, &emu->cpu);
+    timer8_init(&emu->timer8[1], 1, &emu->cpu);
+
+    /* Timer16 channels: (channel, tgrCount, baseVector, cpu) */
+    timer16_init(&emu->timer16[0], 0, 4, 32, &emu->cpu);
+    timer16_init(&emu->timer16[1], 1, 2, 40, &emu->cpu);
+    timer16_init(&emu->timer16[2], 2, 2, 44, &emu->cpu);
+    timer16_init(&emu->timer16[3], 3, 4, 48, &emu->cpu);
+    timer16_init(&emu->timer16[4], 4, 2, 56, &emu->cpu);
+    timer16_init(&emu->timer16[5], 5, 2, 60, &emu->cpu);
+
+    emu->timer16[1].output_b_cb = timer16_ch1_tiocb_cb;
+    emu->timer16[1].output_b_ctx = emu;
+
+    speaker_init(&emu->speaker, CYBIKO_CLOCK_HZ);
+    keyboard_init(&emu->keyboard, CYBIKO_KEYBOARD_SCAN_COLS);
+}
+
 /* ---------- lifecycle ---------- */
 
 cybiko_emu_t *cybiko_create(const cybiko_hal_t *hal) {
@@ -125,27 +146,9 @@ cybiko_emu_t *cybiko_create(const cybiko_hal_t *hal) {
     emu->bus.speaker  = &emu->speaker;
     emu->bus.keyboard = &emu->keyboard;
 
-    /* Initialize peripherals */
-    hd66421_init(&emu->lcd);
-
-    timer8_init(&emu->timer8[0], 0, &emu->cpu);
-    timer8_init(&emu->timer8[1], 1, &emu->cpu);
-
-    /* Timer16 channels: (channel, tgrCount, baseVector, cpu) */
-    timer16_init(&emu->timer16[0], 0, 4, 32, &emu->cpu);
-    timer16_init(&emu->timer16[1], 1, 2, 40, &emu->cpu);
-    timer16_init(&emu->timer16[2], 2, 2, 44, &emu->cpu);
-    timer16_init(&emu->timer16[3], 3, 4, 48, &emu->cpu);
-    timer16_init(&emu->timer16[4], 4, 2, 56, &emu->cpu);
-    timer16_init(&emu->timer16[5], 5, 2, 60, &emu->cpu);
-
-    /* Wire Timer16 ch1 TIOCB1 output compare to speaker */
-    emu->timer16[1].output_b_cb = timer16_ch1_tiocb_cb;
-    emu->timer16[1].output_b_ctx = emu;
+    init_peripherals(emu);
 
     cybiko_rtc_init(&emu->rtc);
-    speaker_init(&emu->speaker, CYBIKO_CLOCK_HZ);
-    keyboard_init(&emu->keyboard, CYBIKO_KEYBOARD_SCAN_COLS);
 
     /* Initialize CPU (needs bus already wired) */
     h8s_cpu_init(&emu->cpu, &emu->bus);
@@ -198,6 +201,36 @@ bool cybiko_load_nvram(cybiko_emu_t *emu, const uint8_t *data, size_t len) {
 
 void cybiko_reset(cybiko_emu_t *emu) {
     h8s_cpu_reset(&emu->cpu);
+}
+
+void cybiko_reboot(cybiko_emu_t *emu) {
+    if (!emu) return;
+    if (emu->bus.on_chip_ram.data)
+        memset(emu->bus.on_chip_ram.data, 0, emu->bus.on_chip_ram.size);
+    if (emu->bus.external_ram.data)
+        memset(emu->bus.external_ram.data, 0, emu->bus.external_ram.size);
+    memset(emu->bus.sci_output_pos, 0, sizeof emu->bus.sci_output_pos);
+#if CYBIKO_HAS_SPI_FLASH
+    memset(emu->prev_keys, 0, sizeof emu->prev_keys);
+    emu->key_irq_retries = 0;
+    if (emu->bus.sci0.bound) {
+        emu->bus.sci0.scr = 0;
+        emu->bus.sci0.tdre = true;
+        emu->bus.sci0.rdrf = false;
+        emu->bus.sci0.rdr = 0;
+        emu->bus.sci0.txi_delay = 0;
+        emu->bus.sci0.async_countdown = 0;
+        emu->bus.sci0.radio_up = false;
+        emu->bus.sci0.tx_frames = 0;
+        emu->bus.sci0.rx_injected = 0;
+    }
+#endif
+    init_peripherals(emu);
+    h8s_cpu_reset(&emu->cpu);
+    emu->running = true;
+    emu->total_steps = 0;
+    emu->sleep_cycles = 0;
+    emu->frame_count = 0;
 }
 
 /* ---------- main frame loop ---------- */
