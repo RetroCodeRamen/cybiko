@@ -38,11 +38,12 @@ static const vkey_t KM[] = {
 /* Frames a key is held, then all keys up before the next. HOLD and GAP in
  * the environment override them. */
 static int hold_frames = 12, gap_frames = 3;   /* as the T-Deck types */
+#define REPEAT_GAP 10   /* the same key twice needs this long up */
 
 typedef struct {
     const char *name, *script;
     int pos, wait_until, key_left, gap_left, dumps;
-    const vkey_t *key;
+    const vkey_t *key, *last;
     uint16_t keys[CYBIKO_KEYBOARD_COLUMNS];
     const uint8_t *px;
     cybiko_emu_t *emu;
@@ -144,7 +145,14 @@ static void step_script(side_t *d) {
         if (c == '!') { dump(d, "snap"); continue; }
         const vkey_t *k = key_for(c);
         if (!k) continue;
-        d->key = k;
+        if (k == d->last && d->gap_left == 0 && gap_frames < REPEAT_GAP) {
+            /* hold this key back until it has been up long enough */
+            d->pos--;
+            d->gap_left = REPEAT_GAP - gap_frames;
+            d->last = NULL;
+            return;
+        }
+        d->key = d->last = k;
         d->key_left = hold_frames - 1;
         d->gap_left = gap_frames;
         d->keys[k->col] |= k->mask;

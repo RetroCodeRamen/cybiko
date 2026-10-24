@@ -161,11 +161,13 @@ static void render_frame_body(const uint8_t *pixels, int w, int h) {
 // 10 frames now and then (tools/v1_chat.c: 8 frames dropped about one key
 // in four, 10 and up dropped none). Typed keys are taps, one at a time:
 // a second tap of the same key during the first would only lengthen it,
-// so "ll" came out as "l". The C3 keyboard only keeps one unread byte, so
+// so "ll" came out as "l", and it needs 10 frames up before it goes down
+// again (other keys need only 3). The C3 keyboard only keeps one unread byte, so
 // I2C is drained on its own task.
 #define MAX_ACTIVE_KEYS 16
 #define KEY_HOLD_FRAMES 12
 #define KEY_GAP_FRAMES  3     // all keys up between two taps
+#define KEY_REPEAT_GAP_FRAMES 10  // ...of the same key: 3 or 6 lost the second
 #define KEY_HOLD_STICKY (-1)  // stays down until release_key()
 #define KB_QUEUE_LEN    32
 #define TAP_QUEUE_LEN   32
@@ -190,7 +192,13 @@ static bool fn_pending = false;
 // Typed keys waiting their turn, each a key plus Shift or Fn
 static tdeck_key_event_t tap_queue[TAP_QUEUE_LEN];
 static int tap_head, tap_count;
-static int tap_gap = KEY_GAP_FRAMES;   // frames since every pulsed key went up
+static int tap_gap = KEY_REPEAT_GAP_FRAMES;   // frames since every pulsed key went up
+static tdeck_key_event_t last_tap;
+
+static int gap_before(const tdeck_key_event_t *ev) {
+    return ev->col == last_tap.col && ev->mask == last_tap.mask
+           ? KEY_REPEAT_GAP_FRAMES : KEY_GAP_FRAMES;
+}
 
 static void press_key(int col, uint16_t mask) {
     for (int i = 0; i < active_key_count; i++) {
@@ -269,11 +277,12 @@ static void press_tap(const tdeck_key_event_t *ev) {
             press_key(TDECK_SHIFT_COL, TDECK_SHIFT_MASK);
         press_key(ev->col, ev->mask);
     }
+    last_tap = *ev;
     tap_gap = 0;
 }
 
 static void queue_tap(const tdeck_key_event_t *ev) {
-    if (tap_count == 0 && !pulsed_key_down() && tap_gap >= KEY_GAP_FRAMES) {
+    if (tap_count == 0 && !pulsed_key_down() && tap_gap >= gap_before(ev)) {
         press_tap(ev);
         return;
     }
@@ -309,9 +318,9 @@ static void keyboard_tick_frame(void) {
         tap_gap = 0;
         return;
     }
-    if (tap_gap < KEY_GAP_FRAMES)
+    if (tap_gap < KEY_REPEAT_GAP_FRAMES)
         tap_gap++;
-    if (tap_gap >= KEY_GAP_FRAMES && tap_count > 0) {
+    if (tap_count > 0 && tap_gap >= gap_before(&tap_queue[tap_head])) {
         press_tap(&tap_queue[tap_head]);
         tap_head = (tap_head + 1) % TAP_QUEUE_LEN;
         tap_count--;
