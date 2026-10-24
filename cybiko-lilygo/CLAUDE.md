@@ -66,7 +66,7 @@ ROMs must be on the SD card at:
 - `/cybiko/boot.bin` — XT boot ROM
 - `/cybiko/flash.bin` — XT CyOS
 - `/cybiko/save.nvram` — XT RAM image, written via `save.tmp` every 5 minutes
-- `/cybiko-v1/boot.bin`, `flash.bin`, `save.flash` — Classic env (`T-Deck-Cybiko-V1`)
+- `/cybiko-v1/boot.bin`, `flash.bin`, `save.flash` — Classic env (`T-Deck-Cybiko-V1`); `save.flash` is written via `save.tmp` 10 s after CyOS's last flash page write
 
 ## Critical Technical Notes
 

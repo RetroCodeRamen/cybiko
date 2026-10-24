@@ -1372,7 +1372,7 @@ static const about_line_t ABOUT[] = {
     { "  $s Select $i Ins  $d Del", 0 },
     { "  $g Tab    $q-$u F1-F7", 0 },
     { "  $$ types a dollar sign", 0 },
-    { "  $v or Shift+$ volume", 0 },
+    { "  $p / $m volume up / down", 0 },
 };
 
 static void draw_about(sdl_ctx_t *s) {

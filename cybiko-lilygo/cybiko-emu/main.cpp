@@ -375,7 +375,9 @@ static void init_trackball_interrupts(void) {
 #ifdef CYBIKO_SPLIT_PROFILE
 extern "C" uint32_t cybiko_split[3];
 #endif
-static void volume_step(void);
+static void volume_step(int by);
+static void volume_done(void);
+static void volume_note(char *buf, size_t n);
 
 static void press_special(tdeck_special_key_t k) {
     tdeck_key_event_t ev = {};
@@ -384,9 +386,13 @@ static void press_special(tdeck_special_key_t k) {
 }
 
 // The T-Deck has no Esc, F1-F7, Help, Select, Insert or Delete. $ is a
-// command key: $ then a letter sends one of them ($x = Esc). Shift+$
-// (code 4) and $v step the volume.
+// command key: $ then a letter sends one of them ($x = Esc). $p and $m
+// turn the volume up and down, and start volume mode: more p and m keep
+// stepping it until 2 s pass without one. Any other key ends volume mode
+// and is typed as usual.
+#define VOLUME_MODE_MS 2000
 static bool cmd_pending;
+static unsigned long volume_until;   // volume mode ends at this millis(); 0 = off
 static char chrome_top[40] = "Cybiko";
 
 static void draw_chrome(void) {
@@ -395,14 +401,21 @@ static void draw_chrome(void) {
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     if (chrome_top[0])
         tft.drawString(chrome_top, 4, 2, 2);
-    if (cmd_pending) {
+    if (volume_until) {
+        char note[16];
+        volume_note(note, sizeof note);
+        tft.fillRect(196, 0, SCALED_W - 196, BORDER_TOP, TFT_BLACK);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString(note, 200, 2, 2);
+    }
+    if (cmd_pending || volume_until) {
         tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.drawString("$", 300, 2, 2);
     }
     tft.fillRect(0, BORDER_BOTTOM, SCALED_W, 240 - BORDER_BOTTOM, TFT_BLACK);
     tft.setTextColor(cmd_pending ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
-    tft.drawString(cmd_pending ? "$x Esc  $h Help  $q-u F1-7" :
-                                 "$ then x=Esc h=Help q-u=F1-7",
+    tft.drawString(cmd_pending ? "$x Esc  $h Help  $q-u F1-7  $p/m Vol" :
+                                 "$ then x=Esc h=Help q-u=F1-7 p/m=Vol",
                    4, BORDER_BOTTOM + 2, 2);
 }
 
@@ -413,6 +426,11 @@ static void show_cmd(bool on) {
 
 static void handle_key(char c) {
     boot_done = true;   // someone is using it: back to real time
+    if (volume_until) {
+        if (c == 'p' || c == 'P') { volume_step(+1); return; }
+        if (c == 'm' || c == 'M') { volume_step(-1); return; }
+        volume_done();   // then type the key as usual
+    }
     if (cmd_pending) {
         cmd_pending = false;
         show_cmd(false);
@@ -430,7 +448,8 @@ static void handle_key(char c) {
         case 't': press_special(TDECK_KEY_F5); break;
         case 'y': press_special(TDECK_KEY_F6); break;
         case 'u': press_special(TDECK_KEY_F7); break;
-        case 'v': volume_step(); break;
+        case 'p': volume_step(+1); break;
+        case 'm': volume_step(-1); break;
         case '$': process_ascii_key('$'); break;
         default: break;   // anything else cancels
         }
@@ -439,8 +458,6 @@ static void handle_key(char c) {
     if (c == '$') {
         cmd_pending = true;
         show_cmd(true);
-    } else if (c == 0x04) {
-        volume_step();
     } else {
         process_ascii_key(c);
     }
@@ -611,36 +628,56 @@ static bool i2s_initialized = false;
 static QueueHandle_t i2s_events;
 static uint32_t i2s_underruns;  // DMA ran dry: an audible gap
 
-// The T-Deck has no volume knob. Shift+$ steps through these; the choice
-// is kept in NVS. Full scale was too loud on the T-Deck's amplifier.
-static const uint16_t VOLUME_Q8[] = { 256, 128, 64, 32, 0 };
-#define VOLUME_STEPS (sizeof VOLUME_Q8 / sizeof VOLUME_Q8[0])
-#define VOLUME_DEFAULT 1   // 50%
+// The T-Deck has no volume knob. $p and $m step the level up and down,
+// from 0 (off) to 10; the level is kept in NVS. Gain is 256 for
+// full scale, which was too loud on the T-Deck's amplifier.
+//   level  0  1  2  3   4   5   6   7   8   9   10
+//   %      0  3  6  9  12  18  25  37  50  75  100
+static const uint16_t VOLUME_Q8[] = { 0, 8, 15, 23, 31, 46, 64, 95, 128, 192, 256 };
+#define VOLUME_MAX (sizeof VOLUME_Q8 / sizeof VOLUME_Q8[0] - 1)
+#define VOLUME_DEFAULT 8   // 50%
 static uint8_t volume_idx = VOLUME_DEFAULT;
+static uint8_t volume_saved = VOLUME_DEFAULT;
 
 static void volume_load(void) {
     Preferences p;
     p.begin("cybiko", true);
-    volume_idx = p.getUChar("vol", VOLUME_DEFAULT);
+    // "vol" held an index into the old 5-step table; this is a new key.
+    volume_idx = p.getUChar("level", VOLUME_DEFAULT);
     p.end();
-    if (volume_idx >= VOLUME_STEPS) volume_idx = VOLUME_DEFAULT;
+    if (volume_idx > VOLUME_MAX) volume_idx = VOLUME_DEFAULT;
+    volume_saved = volume_idx;
 }
 
-static void volume_step(void) {
-    volume_idx = (volume_idx + 1) % VOLUME_STEPS;
-    Preferences p;
-    p.begin("cybiko", false);
-    p.putUChar("vol", volume_idx);
-    p.end();
-    char note[24];
-    if (VOLUME_Q8[volume_idx])
-        snprintf(note, sizeof note, "volume %u%%   ", VOLUME_Q8[volume_idx] * 100 / 256);
+static void volume_note(char *buf, size_t n) {
+    if (volume_idx)
+        snprintf(buf, n, "volume %u", volume_idx);
     else
-        snprintf(note, sizeof note, "volume off   ");
-    tft.dmaWait();
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(note, 200, 2, 2);
+        snprintf(buf, n, "volume off");
+}
+
+// Takes effect at once; NVS is written once volume mode ends.
+static void volume_step(int by) {
+    int v = volume_idx + by;
+    volume_idx = v < 0 ? 0 : v > (int)VOLUME_MAX ? VOLUME_MAX : v;
+    volume_until = millis() + VOLUME_MODE_MS;
+    if (!volume_until) volume_until = 1;   // 0 means off
+    draw_chrome();
+    char note[16];
+    volume_note(note, sizeof note);
     Serial.printf("%s\n", note);
+}
+
+static void volume_done(void) {
+    volume_until = 0;
+    if (volume_idx != volume_saved) {
+        Preferences p;
+        p.begin("cybiko", false);
+        p.putUChar("level", volume_idx);
+        p.end();
+        volume_saved = volume_idx;
+    }
+    draw_chrome();
 }
 
 static void init_i2s(void) {
@@ -772,7 +809,8 @@ static uint8_t *load_sd_file(const char *path, size_t *out_size) {
     return buf;
 }
 
-// NVRAM save — only every 5 minutes, with hash check to skip unchanged data
+// NVRAM save — the Xtreme every 5 minutes, the Classic 10 s after CyOS's
+// last flash write; both skip unchanged data
 static uint32_t last_nvram_hash = 0;
 
 static uint32_t simple_hash(const uint8_t *data, size_t len) {
@@ -948,6 +986,10 @@ static uint32_t frame_us = 0;
 static cybiko_stats_t last_stats = {};
 #ifndef NVRAM_SAVE_INTERVAL_MS
 #define NVRAM_SAVE_INTERVAL_MS 300000  // 5 minutes
+#endif
+#ifdef CYBIKO_MACHINE_V1
+#define FLASH_SAVE_QUIET_MS 10000       // after CyOS's last page write
+static uint32_t flash_writes_seen;
 #endif
 #define FPS_REPORT_INTERVAL_MS 5000
 
@@ -1640,11 +1682,33 @@ void loop() {
         last_fps_report = now;
     }
 
+    if (volume_until && (long)(now - volume_until) >= 0)
+        volume_done();
+
+#ifdef CYBIKO_MACHINE_V1
+    // Save the flash image once CyOS has stopped writing it for 10 s, so a
+    // changed setting is on the card soon after, not up to 5 minutes later.
+    // A failed save is retried 10 s on.
+    {
+        size_t len;
+        uint32_t writes = 0;
+        cybiko_get_spi_flash(emu, &len, &writes);
+        if (writes != flash_writes_seen) {
+            flash_writes_seen = writes;
+            last_nvram_save_ms = now;
+        }
+        if (writes != last_nvram_hash && now - last_nvram_save_ms >= FLASH_SAVE_QUIET_MS) {
+            save_nvram(emu);
+            last_nvram_save_ms = now;
+        }
+    }
+#else
     // Auto-save NVRAM every 5 minutes
     if (now - last_nvram_save_ms >= NVRAM_SAVE_INTERVAL_MS) {
         save_nvram(emu);
         last_nvram_save_ms = now;
     }
+#endif
 
     pace_frame();
 }
