@@ -393,7 +393,7 @@ static void press_special(tdeck_special_key_t k) {
 #define VOLUME_MODE_MS 2000
 static bool cmd_pending;
 static unsigned long volume_until;   // volume mode ends at this millis(); 0 = off
-static char chrome_top[40] = "Cybiko";
+static char chrome_top[40] = "ReBiko Pocket";
 
 static void draw_chrome(void) {
     tft.dmaWait();
@@ -1493,7 +1493,7 @@ void setup() {
     emu_started_ms = millis();
     snprintf(chrome_top, sizeof chrome_top, "Loading CyOS...");
     draw_chrome();
-    Serial.println("Cybiko emulator started");
+    Serial.println("ReBiko Pocket started");
 }
 
 // Hold the guest to the real Cybiko's 60 Hz. Each frame is a fixed slice

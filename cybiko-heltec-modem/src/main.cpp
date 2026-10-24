@@ -73,12 +73,12 @@ static void oled_draw(void) {
 
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x12_tf);
-    u8g2.drawStr(0, 12, "CyRadio");
+    u8g2.drawStr(0, 12, "ReBiko Radio");   /* 72 px */
     u8g2.drawStr(128 - u8g2.getStrWidth(st), 12, st);
     if (pulse)
-        u8g2.drawBox(58, 3, 8, 8);
+        u8g2.drawBox(82, 3, 8, 8);
     if (linked)
-        u8g2.drawBox(52, 4, 4, 6);
+        u8g2.drawBox(76, 4, 4, 6);
 
     snprintf(line, sizeof line, "%lu.%03lu MHz SF%u",
              (unsigned long)(prof.freq_hz / 1000000),
@@ -205,7 +205,7 @@ void setup() {
     phy = rc == 0 ? cybiko_sx1262_phy() : NULL;
 
     char hello[96];
-    snprintf(hello, sizeof hello, "cybiko-heltec-modem begin %d (%s)", rc,
+    snprintf(hello, sizeof hello, "ReBiko Radio begin %d (%s)", rc,
              cybiko_sx1262_phy_error());
     send_text('H', hello);
     send_status();

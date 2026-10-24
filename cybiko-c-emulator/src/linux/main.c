@@ -657,7 +657,7 @@ int main(int argc, char *argv[])
         if (cybiko_serial_phy_open(&radio_phy, radio_path) != 0) {
             fprintf(stderr, "Warning: radio '%s': %s%s\n",
                     radio_path, strerror(errno),
-                    errno == EBUSY ? " — another emulator already has CyRadio"
+                    errno == EBUSY ? " — another emulator already has ReBiko Radio"
                                    : ", running without radio");
         } else if (!cybiko_patch_cyid(emu, cyid)) {
             fprintf(stderr, "Warning: CyID patch failed, running without radio\n");

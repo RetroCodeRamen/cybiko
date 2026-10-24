@@ -1208,7 +1208,7 @@ static void open_settings(sdl_ctx_t *s) {
         return;
     }
     if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
-    s->settings_win = SDL_CreateWindow("Cybiko Settings",
+    s->settings_win = SDL_CreateWindow("ReBiko Settings",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         SETTINGS_W, SETTINGS_H, flags);
     s->settings_ren = s->settings_win
@@ -1382,7 +1382,7 @@ static void draw_about(sdl_ctx_t *s) {
     shell_accent(s->color, &ar, &ag, &ab);
     SDL_SetRenderDrawColor(s->about_ren, 16, 20, 28, 255);
     SDL_RenderClear(s->about_ren);
-    draw_text(s->about_ren, 20, 16, 2, ar, ag, ab, "Cybiko");
+    draw_text(s->about_ren, 20, 16, 2, ar, ag, ab, "ReBiko Desktop");
     snprintf(ver, sizeof ver, "v%s  original CyOS", CYBIKO_EMU_VERSION);
     draw_text(s->about_ren, 20, 40, 1, 180, 190, 210, ver);
     for (size_t i = 0; i < sizeof ABOUT / sizeof ABOUT[0]; i++) {
@@ -1405,7 +1405,7 @@ static void open_about(sdl_ctx_t *s) {
         return;
     }
     if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
-    s->about_win = SDL_CreateWindow("Cybiko Help",
+    s->about_win = SDL_CreateWindow("ReBiko Help",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         ABOUT_W, ABOUT_H, flags);
     s->about_ren = s->about_win
@@ -1455,7 +1455,7 @@ static void draw_status(sdl_ctx_t *s) {
     draw_text(ren, 20, 76, 1, heltec_yes ? 90 : 255, heltec_yes ? 220 : 90,
               heltec_yes ? 130 : 90, line);
     if (s->radio_on)
-        draw_text(ren, 20, 92, 1, 90, 220, 130, "  CyRadio linked");
+        draw_text(ren, 20, 92, 1, 90, 220, 130, "  ReBiko Radio linked");
     else if (heltec_yes)
         draw_text(ren, 20, 92, 1, 255, 180, 80, "  seen, radio not open");
     else
@@ -1513,7 +1513,7 @@ static void open_status(sdl_ctx_t *s) {
         return;
     }
     if (s->always_on_top) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
-    s->status_win = SDL_CreateWindow("Cybiko Status",
+    s->status_win = SDL_CreateWindow("ReBiko Status",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         STATUS_W, STATUS_H, flags);
     s->status_ren = s->status_win
@@ -1939,11 +1939,11 @@ static void radio_report(const cybiko_emu_t *emu, const cybiko_lora_t *lt,
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
-        fprintf(stdout, "Cybiko Classic %s\n", CYBIKO_EMU_VERSION);
+        fprintf(stdout, "ReBiko Desktop %s\n", CYBIKO_EMU_VERSION);
         return 0;
     }
     if (argc < 3) {
-        fprintf(stderr, "Cybiko Classic %s\n"
+        fprintf(stderr, "ReBiko Desktop %s\n"
                 "usage: %s boot.bin flash.bin [--nvram save.flash] "
                 "[--radio PORT] [--cyid 4C000001] [--shell cybiko.png]\n"
                 "  PORT is /dev/ttyUSB0 or COMn; omitted = first Heltec CP2102\n",
@@ -1985,7 +1985,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ARGB visual 0x%lx\n", vis);
         }
     }
-    fprintf(stderr, "Cybiko Classic %s\n", CYBIKO_EMU_VERSION);
+    fprintf(stderr, "ReBiko Desktop %s\n", CYBIKO_EMU_VERSION);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -2035,21 +2035,21 @@ int main(int argc, char **argv) {
                 win_w = sdl.fit_w * sdl.scale_pct / 100;
                 win_h = sdl.fit_h * sdl.scale_pct / 100;
             }
-            win = SDL_CreateShapedWindow("Cybiko Classic",
+            win = SDL_CreateShapedWindow("ReBiko Desktop",
                 (unsigned)SDL_WINDOWPOS_CENTERED, (unsigned)SDL_WINDOWPOS_CENTERED,
                 (unsigned)win_w, (unsigned)win_h,
                 SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS);
             if (!win) {
                 fprintf(stderr, "shaped window failed (%s), borderless instead\n",
                         SDL_GetError());
-                win = SDL_CreateWindow("Cybiko Classic",
+                win = SDL_CreateWindow("ReBiko Desktop",
                     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                     win_w, win_h, SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS);
             }
         }
     }
     if (!win)
-        win = SDL_CreateWindow("Cybiko Classic",
+        win = SDL_CreateWindow("ReBiko Desktop",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             win_w, win_h, SDL_WINDOW_HIDDEN);
     /* Accelerated/GL targets stay rectangular; software + XShape actually
@@ -2146,7 +2146,7 @@ int main(int argc, char **argv) {
         if (cybiko_serial_phy_open(&phy, radio_path) != 0) {
             fprintf(stderr, "radio '%s': %s%s\n", radio_path, strerror(errno),
                     errno == EBUSY
-                        ? " — this window will not use CyRadio"
+                        ? " — this window will not use ReBiko Radio"
                         : ", continuing without radio");
         } else {
             phy.on_text = radio_on_text;

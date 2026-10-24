@@ -212,7 +212,7 @@ static void read_comm(int pid, char *dst, size_t cap) {
 }
 
 /* Another process already holding this char device. Linux allows two
- * opens of the same tty; both would then drive CyRadio. */
+ * opens of the same tty; both would then drive ReBiko Radio. */
 static int port_holder(const char *path, int self, char *cmd, size_t cap) {
     struct stat want;
     DIR *proc;
@@ -265,10 +265,10 @@ static int port_holder(const char *path, int self, char *cmd, size_t cap) {
 
 static void report_busy(const char *path, int pid, const char *cmd) {
     if (pid > 0)
-        fprintf(stderr, "CyRadio %s already in use by pid %d (%s)\n",
+        fprintf(stderr, "ReBiko Radio %s already in use by pid %d (%s)\n",
                 path, pid, cmd && cmd[0] ? cmd : "?");
     else
-        fprintf(stderr, "CyRadio %s already in use by another process\n", path);
+        fprintf(stderr, "ReBiko Radio %s already in use by another process\n", path);
 }
 #endif
 
@@ -294,7 +294,7 @@ int cybiko_serial_phy_open(cybiko_serial_phy_t *s, const char *path) {
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
         if (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) {
-            fprintf(stderr, "CyRadio %s already in use by another emulator\n", path);
+            fprintf(stderr, "ReBiko Radio %s already in use by another emulator\n", path);
             errno = EBUSY;
         } else if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
             errno = ENOENT;
